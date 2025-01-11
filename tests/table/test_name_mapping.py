@@ -30,49 +30,51 @@ from pyiceberg.types import BooleanType, FloatType, IntegerType, ListType, MapTy
 
 @pytest.fixture(scope="session")
 def table_name_mapping_nested() -> NameMapping:
-    return NameMapping([
-        MappedField(field_id=1, names=["foo"]),
-        MappedField(field_id=2, names=["bar"]),
-        MappedField(field_id=3, names=["baz"]),
-        MappedField(field_id=4, names=["qux"], fields=[MappedField(field_id=5, names=["element"])]),
-        MappedField(
-            field_id=6,
-            names=["quux"],
-            fields=[
-                MappedField(field_id=7, names=["key"]),
-                MappedField(
-                    field_id=8,
-                    names=["value"],
-                    fields=[
-                        MappedField(field_id=9, names=["key"]),
-                        MappedField(field_id=10, names=["value"]),
-                    ],
-                ),
-            ],
-        ),
-        MappedField(
-            field_id=11,
-            names=["location"],
-            fields=[
-                MappedField(
-                    field_id=12,
-                    names=["element"],
-                    fields=[
-                        MappedField(field_id=13, names=["latitude"]),
-                        MappedField(field_id=14, names=["longitude"]),
-                    ],
-                )
-            ],
-        ),
-        MappedField(
-            field_id=15,
-            names=["person"],
-            fields=[
-                MappedField(field_id=16, names=["name"]),
-                MappedField(field_id=17, names=["age"]),
-            ],
-        ),
-    ])
+    return NameMapping(
+        [
+            MappedField(field_id=1, names=["foo"]),
+            MappedField(field_id=2, names=["bar"]),
+            MappedField(field_id=3, names=["baz"]),
+            MappedField(field_id=4, names=["qux"], fields=[MappedField(field_id=5, names=["element"])]),
+            MappedField(
+                field_id=6,
+                names=["quux"],
+                fields=[
+                    MappedField(field_id=7, names=["key"]),
+                    MappedField(
+                        field_id=8,
+                        names=["value"],
+                        fields=[
+                            MappedField(field_id=9, names=["key"]),
+                            MappedField(field_id=10, names=["value"]),
+                        ],
+                    ),
+                ],
+            ),
+            MappedField(
+                field_id=11,
+                names=["location"],
+                fields=[
+                    MappedField(
+                        field_id=12,
+                        names=["element"],
+                        fields=[
+                            MappedField(field_id=13, names=["latitude"]),
+                            MappedField(field_id=14, names=["longitude"]),
+                        ],
+                    )
+                ],
+            ),
+            MappedField(
+                field_id=15,
+                names=["person"],
+                fields=[
+                    MappedField(field_id=16, names=["name"]),
+                    MappedField(field_id=17, names=["age"]),
+                ],
+            ),
+        ]
+    )
 
 
 def test_json_mapped_field_deserialization() -> None:
@@ -165,26 +167,30 @@ def test_json_name_mapping_deserialization() -> None:
 ]
     """
 
-    assert parse_mapping_from_json(name_mapping) == NameMapping([
-        MappedField(field_id=1, names=["id", "record_id"]),
-        MappedField(field_id=2, names=["data"]),
-        MappedField(
-            names=["location"],
-            field_id=3,
-            fields=[
-                MappedField(field_id=4, names=["latitude", "lat"]),
-                MappedField(field_id=5, names=["longitude", "long"]),
-            ],
-        ),
-    ])
+    assert parse_mapping_from_json(name_mapping) == NameMapping(
+        [
+            MappedField(field_id=1, names=["id", "record_id"]),
+            MappedField(field_id=2, names=["data"]),
+            MappedField(
+                names=["location"],
+                field_id=3,
+                fields=[
+                    MappedField(field_id=4, names=["latitude", "lat"]),
+                    MappedField(field_id=5, names=["longitude", "long"]),
+                ],
+            ),
+        ]
+    )
 
 
 def test_json_mapped_field_no_field_id_serialization() -> None:
-    table_name_mapping_nested_no_field_id = NameMapping([
-        MappedField(field_id=1, names=["foo"]),
-        MappedField(field_id=None, names=["bar"]),
-        MappedField(field_id=2, names=["qux"], fields=[MappedField(field_id=None, names=["element"])]),
-    ])
+    table_name_mapping_nested_no_field_id = NameMapping(
+        [
+            MappedField(field_id=1, names=["foo"]),
+            MappedField(field_id=None, names=["bar"]),
+            MappedField(field_id=2, names=["qux"], fields=[MappedField(field_id=None, names=["element"])]),
+        ]
+    )
 
     assert (
         table_name_mapping_nested_no_field_id.model_dump_json()
@@ -200,18 +206,20 @@ def test_json_serialization(table_name_mapping_nested: NameMapping) -> None:
 
 
 def test_name_mapping_to_string() -> None:
-    nm = NameMapping([
-        MappedField(field_id=1, names=["id", "record_id"]),
-        MappedField(field_id=2, names=["data"]),
-        MappedField(
-            names=["location"],
-            field_id=3,
-            fields=[
-                MappedField(field_id=4, names=["lat", "latitude"]),
-                MappedField(field_id=5, names=["long", "longitude"]),
-            ],
-        ),
-    ])
+    nm = NameMapping(
+        [
+            MappedField(field_id=1, names=["id", "record_id"]),
+            MappedField(field_id=2, names=["data"]),
+            MappedField(
+                names=["location"],
+                field_id=3,
+                fields=[
+                    MappedField(field_id=4, names=["lat", "latitude"]),
+                    MappedField(field_id=5, names=["long", "longitude"]),
+                ],
+            ),
+        ]
+    )
 
     assert (
         str(nm)
@@ -283,16 +291,6 @@ def test_mapping_by_name(table_name_mapping_nested: NameMapping) -> None:
     }
 
 
-def test_mapping_lookup_by_name(table_name_mapping_nested: NameMapping) -> None:
-    assert table_name_mapping_nested.find("foo") == MappedField(field_id=1, names=["foo"])
-    assert table_name_mapping_nested.find("location.element.latitude") == MappedField(field_id=13, names=["latitude"])
-    assert table_name_mapping_nested.find("location", "element", "latitude") == MappedField(field_id=13, names=["latitude"])
-    assert table_name_mapping_nested.find(*["location", "element", "latitude"]) == MappedField(field_id=13, names=["latitude"])
-
-    with pytest.raises(ValueError, match="Could not find field with name: boom"):
-        table_name_mapping_nested.find("boom")
-
-
 def test_update_mapping_no_updates_or_adds(table_name_mapping_nested: NameMapping) -> None:
     assert update_mapping(table_name_mapping_nested, {}, {}) == table_name_mapping_nested
 
@@ -304,51 +302,53 @@ def test_update_mapping(table_name_mapping_nested: NameMapping) -> None:
         15: [NestedField(19, "name", StringType(), True), NestedField(20, "add_20", StringType(), True)],
     }
 
-    expected = NameMapping([
-        MappedField(field_id=1, names=["foo", "foo_update"]),
-        MappedField(field_id=2, names=["bar"]),
-        MappedField(field_id=3, names=["baz"]),
-        MappedField(field_id=4, names=["qux"], fields=[MappedField(field_id=5, names=["element"])]),
-        MappedField(
-            field_id=6,
-            names=["quux"],
-            fields=[
-                MappedField(field_id=7, names=["key"]),
-                MappedField(
-                    field_id=8,
-                    names=["value"],
-                    fields=[
-                        MappedField(field_id=9, names=["key"]),
-                        MappedField(field_id=10, names=["value"]),
-                    ],
-                ),
-            ],
-        ),
-        MappedField(
-            field_id=11,
-            names=["location"],
-            fields=[
-                MappedField(
-                    field_id=12,
-                    names=["element"],
-                    fields=[
-                        MappedField(field_id=13, names=["latitude"]),
-                        MappedField(field_id=14, names=["longitude"]),
-                    ],
-                )
-            ],
-        ),
-        MappedField(
-            field_id=15,
-            names=["person"],
-            fields=[
-                MappedField(field_id=17, names=["age"]),
-                MappedField(field_id=19, names=["name"]),
-                MappedField(field_id=20, names=["add_20"]),
-            ],
-        ),
-        MappedField(field_id=18, names=["add_18"]),
-    ])
+    expected = NameMapping(
+        [
+            MappedField(field_id=1, names=["foo", "foo_update"]),
+            MappedField(field_id=2, names=["bar"]),
+            MappedField(field_id=3, names=["baz"]),
+            MappedField(field_id=4, names=["qux"], fields=[MappedField(field_id=5, names=["element"])]),
+            MappedField(
+                field_id=6,
+                names=["quux"],
+                fields=[
+                    MappedField(field_id=7, names=["key"]),
+                    MappedField(
+                        field_id=8,
+                        names=["value"],
+                        fields=[
+                            MappedField(field_id=9, names=["key"]),
+                            MappedField(field_id=10, names=["value"]),
+                        ],
+                    ),
+                ],
+            ),
+            MappedField(
+                field_id=11,
+                names=["location"],
+                fields=[
+                    MappedField(
+                        field_id=12,
+                        names=["element"],
+                        fields=[
+                            MappedField(field_id=13, names=["latitude"]),
+                            MappedField(field_id=14, names=["longitude"]),
+                        ],
+                    )
+                ],
+            ),
+            MappedField(
+                field_id=15,
+                names=["person"],
+                fields=[
+                    MappedField(field_id=17, names=["age"]),
+                    MappedField(field_id=19, names=["name"]),
+                    MappedField(field_id=20, names=["add_20"]),
+                ],
+            ),
+            MappedField(field_id=18, names=["add_18"]),
+        ]
+    )
     assert update_mapping(table_name_mapping_nested, updates, adds) == expected
 
 

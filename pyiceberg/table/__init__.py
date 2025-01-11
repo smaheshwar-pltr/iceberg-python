@@ -111,14 +111,11 @@ from pyiceberg.table.update import (
     UpgradeFormatVersionUpdate,
     update_table_metadata,
 )
-from pyiceberg.table.update.schema import UpdateSchema, _Move, _MoveOperation
+from pyiceberg.table.update.schema import UpdateSchema
 from pyiceberg.table.update.snapshot import (
     ManageSnapshots,
     UpdateSnapshot,
-    _DeleteFiles,
     _FastAppendFiles,
-    _MergeAppendFiles,
-    _OverwriteFiles,
 )
 from pyiceberg.table.update.spec import UpdateSpec
 from pyiceberg.transforms import IdentityTransform
@@ -137,8 +134,6 @@ from pyiceberg.types import (
 )
 from pyiceberg.utils.concurrent import ExecutorFactory
 from pyiceberg.utils.config import Config
-from pyiceberg.utils.deprecated import deprecated
-from pyiceberg.utils.deprecated import deprecation_message as deprecation_message
 from pyiceberg.utils.properties import property_as_bool
 
 if TYPE_CHECKING:
@@ -191,6 +186,14 @@ class TableProperties:
 
     WRITE_PARTITION_SUMMARY_LIMIT = "write.summary.partition-limit"
     WRITE_PARTITION_SUMMARY_LIMIT_DEFAULT = 0
+
+    WRITE_PY_LOCATION_PROVIDER_IMPL = "write.py-location-provider.impl"
+
+    OBJECT_STORE_ENABLED = "write.object-storage.enabled"
+    OBJECT_STORE_ENABLED_DEFAULT = True  # Differs from the Java implementation
+
+    WRITE_OBJECT_STORE_PARTITIONED_PATHS = "write.object-storage.partitioned-paths"
+    WRITE_OBJECT_STORE_PARTITIONED_PATHS_DEFAULT = True
 
     DELETE_MODE = "write.delete.mode"
     DELETE_MODE_COPY_ON_WRITE = "copy-on-write"
@@ -634,18 +637,20 @@ class Transaction:
                 if len(filtered_df) == 0:
                     replaced_files.append((original_file.file, []))
                 elif len(df) != len(filtered_df):
-                    replaced_files.append((
-                        original_file.file,
-                        list(
-                            _dataframe_to_data_files(
-                                io=self._table.io,
-                                df=filtered_df,
-                                table_metadata=self.table_metadata,
-                                write_uuid=commit_uuid,
-                                counter=counter,
-                            )
-                        ),
-                    ))
+                    replaced_files.append(
+                        (
+                            original_file.file,
+                            list(
+                                _dataframe_to_data_files(
+                                    io=self._table.io,
+                                    df=filtered_df,
+                                    table_metadata=self.table_metadata,
+                                    write_uuid=commit_uuid,
+                                    counter=counter,
+                                )
+                            ),
+                        )
+                    )
 
             if len(replaced_files) > 0:
                 with self.update_snapshot(snapshot_properties=snapshot_properties).overwrite() as overwrite_snapshot:
@@ -685,9 +690,9 @@ class Transaction:
                 raise ValueError(f"Cannot add files that are already referenced by table, files: {', '.join(referenced_files)}")
 
         if self.table_metadata.name_mapping() is None:
-            self.set_properties(**{
-                TableProperties.DEFAULT_NAME_MAPPING: self.table_metadata.schema().name_mapping.model_dump_json()
-            })
+            self.set_properties(
+                **{TableProperties.DEFAULT_NAME_MAPPING: self.table_metadata.schema().name_mapping.model_dump_json()}
+            )
         with self.update_snapshot(snapshot_properties=snapshot_properties).fast_append() as update_snapshot:
             data_files = _parquet_files_to_data_files(
                 table_metadata=self.table_metadata, file_paths=file_paths, io=self._table.io
@@ -907,7 +912,7 @@ class Table:
 
         Args:
             row_filter:
-                A string or BooleanExpression that decsribes the
+                A string or BooleanExpression that describes the
                 desired rows
             selected_fields:
                 A tuple of strings representing the column names
@@ -1616,13 +1621,6 @@ class WriteTask:
         # https://github.com/apache/iceberg/blob/a582968975dd30ff4917fbbe999f1be903efac02/core/src/main/java/org/apache/iceberg/io/OutputFileFactory.java#L92-L101
         return f"00000-{self.task_id}-{self.write_uuid}.{extension}"
 
-    def generate_data_file_path(self, extension: str) -> str:
-        if self.partition_key:
-            file_path = f"{self.partition_key.to_path()}/{self.generate_data_file_filename(extension)}"
-            return file_path
-        else:
-            return self.generate_data_file_filename(extension)
-
 
 @dataclass(frozen=True)
 class AddFileTask:
@@ -1641,57 +1639,3 @@ def _parquet_files_to_data_files(table_metadata: TableMetadata, file_paths: List
     from pyiceberg.io.pyarrow import parquet_files_to_data_files
 
     yield from parquet_files_to_data_files(io=io, table_metadata=table_metadata, file_paths=iter(file_paths))
-
-
-@deprecated(
-    deprecated_in="0.8.0",
-    removed_in="0.9.0",
-    help_message="pyiceberg.table.Move has been changed to private class pyiceberg.table.update.schema._Move",
-)
-def Move(*args: Any, **kwargs: Any) -> _Move:
-    return _Move(*args, **kwargs)
-
-
-@deprecated(
-    deprecated_in="0.8.0",
-    removed_in="0.9.0",
-    help_message="pyiceberg.table.MoveOperation has been changed to private class pyiceberg.table.update.schema._MoveOperation",
-)
-def MoveOperation(*args: Any, **kwargs: Any) -> _MoveOperation:
-    return _MoveOperation(*args, **kwargs)
-
-
-@deprecated(
-    deprecated_in="0.8.0",
-    removed_in="0.9.0",
-    help_message="pyiceberg.table.DeleteFiles has been changed to private class pyiceberg.table.update.snapshot._DeleteFiles",
-)
-def DeleteFiles(*args: Any, **kwargs: Any) -> _DeleteFiles:
-    return _DeleteFiles(*args, **kwargs)
-
-
-@deprecated(
-    deprecated_in="0.8.0",
-    removed_in="0.9.0",
-    help_message="pyiceberg.table.FastAppendFiles has been changed to private class pyiceberg.table.update.snapshot._FastAppendFiles",
-)
-def FastAppendFiles(*args: Any, **kwargs: Any) -> _FastAppendFiles:
-    return _FastAppendFiles(*args, **kwargs)
-
-
-@deprecated(
-    deprecated_in="0.8.0",
-    removed_in="0.9.0",
-    help_message="pyiceberg.table.MergeAppendFiles has been changed to private class pyiceberg.table.update.snapshot._MergeAppendFiles",
-)
-def MergeAppendFiles(*args: Any, **kwargs: Any) -> _MergeAppendFiles:
-    return _MergeAppendFiles(*args, **kwargs)
-
-
-@deprecated(
-    deprecated_in="0.8.0",
-    removed_in="0.9.0",
-    help_message="pyiceberg.table.OverwriteFiles has been changed to private class pyiceberg.table.update.snapshot._OverwriteFiles",
-)
-def OverwriteFiles(*args: Any, **kwargs: Any) -> _OverwriteFiles:
-    return _OverwriteFiles(*args, **kwargs)
