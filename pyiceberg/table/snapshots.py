@@ -243,6 +243,7 @@ class Snapshot(IcebergBaseModel):
     manifest_list: str = Field(alias="manifest-list", description="Location of the snapshot's manifest list file")
     summary: Optional[Summary] = Field(default=None)
     schema_id: Optional[int] = Field(alias="schema-id", default=None)
+    first_row_id: Optional[int] = Field(alias="first-row-id", default=None)
 
     def __str__(self) -> str:
         """Return the string representation of the Snapshot class."""
