@@ -22,7 +22,12 @@ from uuid import UUID
 import pytest
 
 from pyiceberg.exceptions import ValidationError
-from pyiceberg.partitioning import UNPARTITIONED_PARTITION_SPEC, PartitionField, PartitionSpec
+from pyiceberg.partitioning import (
+    UNPARTITIONED_PARTITION_SPEC,
+    PartitionField,
+    PartitionSpec,
+    assign_fresh_partition_spec_ids_for_replace,
+)
 from pyiceberg.schema import Schema
 from pyiceberg.transforms import (
     BucketTransform,
@@ -31,6 +36,7 @@ from pyiceberg.transforms import (
     IdentityTransform,
     MonthTransform,
     TruncateTransform,
+    VoidTransform,
     YearTransform,
 )
 from pyiceberg.typedef import Record
@@ -310,3 +316,118 @@ def test_incompatible_transform_source_type() -> None:
         spec.check_compatible(schema)
 
     assert "Invalid source field foo with type int for transform: year" in str(exc.value)
+
+
+# The replacement schema as passed in, and after its field IDs are assigned
+REPLACE_SCHEMA = Schema(
+    NestedField(field_id=10, name="id", field_type=LongType(), required=False),
+    NestedField(field_id=20, name="data", field_type=StringType(), required=False),
+    NestedField(field_id=30, name="ts", field_type=TimestampType(), required=False),
+)
+FRESH_REPLACE_SCHEMA = Schema(
+    NestedField(field_id=1, name="id", field_type=LongType(), required=False),
+    NestedField(field_id=2, name="data", field_type=StringType(), required=False),
+    NestedField(field_id=4, name="ts", field_type=TimestampType(), required=False),
+)
+
+
+def test_assign_fresh_partition_spec_ids_for_replace_v2() -> None:
+    specs = [
+        PartitionSpec(
+            PartitionField(source_id=1, field_id=1000, transform=IdentityTransform(), name="id"),
+            PartitionField(source_id=2, field_id=1001, transform=BucketTransform(4), name="data_bucket"),
+            spec_id=0,
+        ),
+        PartitionSpec(PartitionField(source_id=2, field_id=1002, transform=BucketTransform(4), name="data_bucket"), spec_id=1),
+    ]
+    spec = PartitionSpec(
+        PartitionField(source_id=10, field_id=1000, transform=IdentityTransform(), name="id_renamed"),
+        PartitionField(source_id=20, field_id=1001, transform=BucketTransform(4), name="data_bucket"),
+        PartitionField(source_id=30, field_id=1002, transform=DayTransform(), name="ts_day"),
+    )
+
+    fresh_spec = assign_fresh_partition_spec_ids_for_replace(
+        spec,
+        REPLACE_SCHEMA,
+        FRESH_REPLACE_SCHEMA,
+        format_version=2,
+        current_spec=specs[1],
+        specs=specs,
+        last_partition_id=1002,
+    )
+
+    # Fields reuse the highest ID with the same source and transform from any spec, regardless of name
+    assert fresh_spec == PartitionSpec(
+        PartitionField(source_id=1, field_id=1000, transform=IdentityTransform(), name="id_renamed"),
+        PartitionField(source_id=2, field_id=1002, transform=BucketTransform(4), name="data_bucket"),
+        PartitionField(source_id=4, field_id=1003, transform=DayTransform(), name="ts_day"),
+        spec_id=0,
+    )
+
+
+def test_assign_fresh_partition_spec_ids_for_replace_v1() -> None:
+    current_spec = PartitionSpec(
+        PartitionField(source_id=1, field_id=1000, transform=IdentityTransform(), name="id"),
+        PartitionField(source_id=2, field_id=1001, transform=BucketTransform(4), name="data_bucket"),
+        PartitionField(source_id=4, field_id=1002, transform=DayTransform(), name="ts_day"),
+    )
+    spec = PartitionSpec(
+        PartitionField(source_id=20, field_id=1000, transform=BucketTransform(8), name="data_bucket"),
+        PartitionField(source_id=30, field_id=1001, transform=DayTransform(), name="ts_date"),
+    )
+
+    fresh_spec = assign_fresh_partition_spec_ids_for_replace(
+        spec,
+        REPLACE_SCHEMA,
+        FRESH_REPLACE_SCHEMA,
+        format_version=1,
+        current_spec=current_spec,
+        specs=[current_spec],
+        last_partition_id=1002,
+    )
+
+    # All current fields are carried forward. Removed fields become void transforms, renamed when a new field
+    # takes their name, and the remaining new fields are appended.
+    assert fresh_spec == PartitionSpec(
+        PartitionField(source_id=1, field_id=1000, transform=VoidTransform(), name="id"),
+        PartitionField(source_id=2, field_id=1001, transform=VoidTransform(), name="data_bucket_1001"),
+        PartitionField(source_id=4, field_id=1002, transform=DayTransform(), name="ts_date"),
+        PartitionField(source_id=2, field_id=1003, transform=BucketTransform(8), name="data_bucket"),
+        spec_id=0,
+    )
+
+
+def test_assign_fresh_partition_spec_ids_for_replace_rejects_duplicate_names() -> None:
+    current_spec = PartitionSpec(
+        PartitionField(source_id=1, field_id=1000, transform=BucketTransform(4), name="p"),
+        PartitionField(source_id=2, field_id=1001, transform=BucketTransform(4), name="p_1000"),
+    )
+    spec = PartitionSpec(PartitionField(source_id=10, field_id=1000, transform=BucketTransform(8), name="p"))
+
+    # Renaming the void field for "p" collides with "p_1000"
+    with pytest.raises(ValueError, match=r"Partition field names must be unique, found duplicates: \['p_1000'\]"):
+        assign_fresh_partition_spec_ids_for_replace(
+            spec,
+            REPLACE_SCHEMA,
+            FRESH_REPLACE_SCHEMA,
+            format_version=1,
+            current_spec=current_spec,
+            specs=[current_spec],
+            last_partition_id=1001,
+        )
+
+
+def test_assign_fresh_partition_spec_ids_for_replace_rejects_void_field_named_after_other_column() -> None:
+    # "data" was dropped and is added back with a new field ID, while the spec still has a void field named "data"
+    current_spec = PartitionSpec(PartitionField(source_id=3, field_id=1000, transform=VoidTransform(), name="data"))
+
+    with pytest.raises(ValueError, match="Cannot create identity partition sourced from different field in schema: data"):
+        assign_fresh_partition_spec_ids_for_replace(
+            UNPARTITIONED_PARTITION_SPEC,
+            REPLACE_SCHEMA,
+            FRESH_REPLACE_SCHEMA,
+            format_version=1,
+            current_spec=current_spec,
+            specs=[current_spec],
+            last_partition_id=1000,
+        )
