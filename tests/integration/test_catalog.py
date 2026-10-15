@@ -21,6 +21,7 @@ from collections.abc import Generator
 from pathlib import Path, PosixPath
 from typing import Any
 
+import pyarrow as pa
 import pytest
 from pytest_lazy_fixtures import lf
 
@@ -42,9 +43,9 @@ from pyiceberg.io import WAREHOUSE
 from pyiceberg.partitioning import PartitionField, PartitionSpec
 from pyiceberg.schema import INITIAL_SCHEMA_ID, Schema
 from pyiceberg.table.metadata import INITIAL_SPEC_ID
-from pyiceberg.table.sorting import INITIAL_SORT_ORDER_ID, SortField, SortOrder
+from pyiceberg.table.sorting import INITIAL_SORT_ORDER_ID, UNSORTED_SORT_ORDER, SortField, SortOrder
 from pyiceberg.transforms import BucketTransform, DayTransform, IdentityTransform
-from pyiceberg.types import IntegerType, LongType, NestedField, StringType, TimestampType, UUIDType
+from pyiceberg.types import BooleanType, IntegerType, LongType, NestedField, StringType, TimestampType, UUIDType
 from pyiceberg.view import View
 from pyiceberg.view.metadata import SQLViewRepresentation, ViewMetadata, ViewRepresentation, ViewVersion
 from tests.conftest import (
@@ -88,7 +89,15 @@ def sqlite_catalog_file(warehouse: Path) -> Generator[Catalog, None, None]:
 
 @pytest.fixture(scope="function")
 def rest_catalog() -> Generator[Catalog, None, None]:
-    test_catalog = RestCatalog("rest", uri="http://localhost:8181")
+    test_catalog = RestCatalog(
+        "rest",
+        **{
+            "uri": "http://localhost:8181",
+            "s3.endpoint": "http://localhost:9000",
+            "s3.access-key-id": "admin",
+            "s3.secret-access-key": "password",
+        },
+    )
 
     yield test_catalog
 
@@ -417,6 +426,85 @@ def test_concurrent_create_transaction(test_catalog: Catalog, test_schema: Schem
     test_catalog.create_table(identifier, test_schema)
     with pytest.raises(CommitFailedException):
         table.commit_transaction()
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("test_catalog", CATALOGS)
+def test_replace_table_transaction(test_catalog: Catalog, table_name: str, database_name: str) -> None:
+    identifier = (database_name, table_name)
+    schema = Schema(NestedField(1, "id", LongType(), False), NestedField(2, "data", StringType(), False))
+    spec = PartitionSpec(PartitionField(1, 1000, IdentityTransform(), "id"))
+    sort_order = SortOrder(SortField(source_id=1))
+
+    test_catalog.create_namespace(database_name)
+    table = test_catalog.create_table(identifier, schema, partition_spec=spec, sort_order=sort_order, properties={"keep": "a"})
+    table.append(pa.Table.from_pylist([{"id": 1, "data": "a"}], schema=schema.as_arrow()))
+    original_snapshot = table.current_snapshot()
+    assert original_snapshot is not None
+
+    df = pa.Table.from_pylist(
+        [{"data": "b", "id": 2, "extra": True}],
+        schema=pa.schema([pa.field("data", pa.large_string()), pa.field("id", pa.int64()), pa.field("extra", pa.bool_())]),
+    )
+    with test_catalog.replace_table_transaction(identifier, schema=df.schema, properties={"new": "b"}) as txn:
+        txn.append(df)
+
+    replaced = test_catalog.load_table(identifier)
+    assert replaced.metadata.table_uuid == table.metadata.table_uuid
+    assert replaced.schema() == Schema(
+        NestedField(2, "data", StringType(), False),
+        NestedField(1, "id", LongType(), False),
+        NestedField(3, "extra", BooleanType(), False),
+    )
+    assert replaced.spec() == PartitionSpec(spec_id=INITIAL_SPEC_ID + 1)
+    assert replaced.sort_order() == UNSORTED_SORT_ORDER
+    assert replaced.properties.items() >= {"keep": "a", "new": "b"}.items()
+    snapshot = replaced.current_snapshot()
+    assert snapshot is not None
+    assert snapshot.parent_snapshot_id is None
+    assert replaced.scan().to_arrow().to_pylist() == df.to_pylist()
+    assert replaced.scan(snapshot_id=original_snapshot.snapshot_id).to_arrow().to_pylist() == [{"id": 1, "data": "a"}]
+
+    # Replacing with the original definition reuses its schema, spec and sort order
+    test_catalog.replace_table_transaction(
+        identifier, schema=schema, partition_spec=spec, sort_order=sort_order
+    ).commit_transaction()
+
+    replaced = test_catalog.load_table(identifier)
+    assert replaced.schema().schema_id == INITIAL_SCHEMA_ID
+    assert replaced.spec().spec_id == INITIAL_SPEC_ID
+    assert replaced.sort_order().order_id == INITIAL_SORT_ORDER_ID
+    assert replaced.current_snapshot() is None
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("test_catalog", CATALOGS)
+def test_concurrent_replace_table_transaction_conflict(test_catalog: Catalog, table_name: str, database_name: str) -> None:
+    if not does_support_atomic_concurrent_updates(test_catalog):
+        pytest.skip("Catalog does not support atomic concurrent updates")
+
+    schema = Schema(NestedField(1, "id", LongType(), False), NestedField(2, "data", StringType(), False))
+    test_catalog.create_namespace(database_name)
+
+    # Both replaces add a schema with the same ID, with and without assigning new field IDs
+    for suffix, first_schema, second_schema in [
+        (
+            "new_field",
+            Schema(*schema.fields, NestedField(3, "extra", BooleanType(), False)),
+            Schema(*schema.fields, NestedField(3, "extra", BooleanType(), False)),
+        ),
+        ("no_new_field", Schema(schema.fields[0]), Schema(schema.fields[1])),
+    ]:
+        identifier = (database_name, f"{table_name}_{suffix}")
+        test_catalog.create_table(identifier, schema)
+        second = test_catalog.replace_table_transaction(identifier, schema=second_schema)
+        first = test_catalog.replace_table_transaction(identifier, schema=first_schema)
+        first.commit_transaction()
+
+        with pytest.raises(CommitFailedException):
+            second.commit_transaction()
+
+        assert test_catalog.load_table(identifier).schema() == first.table_metadata.schema()
 
 
 @pytest.mark.integration
