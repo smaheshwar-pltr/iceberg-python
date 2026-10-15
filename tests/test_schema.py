@@ -27,6 +27,7 @@ from pyiceberg.schema import (
     Schema,
     _check_schema_compatible,
     assign_fresh_schema_ids,
+    assign_fresh_schema_ids_for_replace,
     build_position_accessors,
     index_by_id,
     index_by_name,
@@ -1868,6 +1869,201 @@ def test_assign_fresh_schema_ids_keeps_default_values() -> None:
             field_type=StructType(
                 NestedField(field_id=3, name="lat", field_type=DoubleType(), required=False, initial_default=1.5)
             ),
+            required=False,
+        ),
+    )
+
+
+def test_assign_fresh_schema_ids_for_replace_reuses_ids_by_name() -> None:
+    base_schema = Schema(
+        NestedField(field_id=1, name="id", field_type=LongType(), required=True),
+        NestedField(field_id=2, name="data", field_type=StringType(), required=False),
+        identifier_field_ids=[1],
+    )
+    schema = Schema(
+        NestedField(field_id=10, name="data", field_type=IntegerType(), required=False),
+        NestedField(field_id=20, name="extra", field_type=BooleanType(), required=False),
+        NestedField(field_id=30, name="id", field_type=LongType(), required=True),
+        identifier_field_ids=[30],
+    )
+
+    fresh_schema = assign_fresh_schema_ids_for_replace(schema, base_schema, last_column_id=2)
+
+    # "data" keeps its ID even though its type changed
+    assert fresh_schema == Schema(
+        NestedField(field_id=2, name="data", field_type=IntegerType(), required=False),
+        NestedField(field_id=3, name="extra", field_type=BooleanType(), required=False),
+        NestedField(field_id=1, name="id", field_type=LongType(), required=True),
+        identifier_field_ids=[1],
+    )
+
+
+def test_assign_fresh_schema_ids_for_replace_nested_fields_without_ids() -> None:
+    base_schema = Schema(
+        NestedField(field_id=1, name="id", field_type=LongType(), required=False),
+        NestedField(
+            field_id=2,
+            name="location",
+            field_type=StructType(NestedField(field_id=3, name="lat", field_type=DoubleType(), required=False)),
+            required=False,
+        ),
+        NestedField(
+            field_id=4,
+            name="points",
+            field_type=ListType(element_id=5, element_type=LongType(), element_required=False),
+            required=False,
+        ),
+        NestedField(
+            field_id=6,
+            name="tags",
+            field_type=MapType(key_id=7, key_type=StringType(), value_id=8, value_type=StringType(), value_required=False),
+            required=False,
+        ),
+    )
+    # A schema converted from PyArrow has -1 for every field ID
+    schema = Schema(
+        NestedField(
+            field_id=-1,
+            name="location",
+            field_type=StructType(
+                NestedField(field_id=-1, name="lat", field_type=DoubleType(), required=False),
+                NestedField(field_id=-1, name="alt", field_type=DoubleType(), required=False),
+            ),
+            required=False,
+        ),
+        NestedField(field_id=-1, name="extra", field_type=BooleanType(), required=False),
+        NestedField(
+            field_id=-1,
+            name="points",
+            field_type=ListType(element_id=-1, element_type=LongType(), element_required=False),
+            required=False,
+        ),
+        NestedField(
+            field_id=-1,
+            name="tags",
+            field_type=MapType(key_id=-1, key_type=StringType(), value_id=-1, value_type=StringType(), value_required=False),
+            required=False,
+        ),
+        NestedField(field_id=-1, name="id", field_type=LongType(), required=False),
+    )
+
+    fresh_schema = assign_fresh_schema_ids_for_replace(schema, base_schema, last_column_id=8)
+
+    # Fresh IDs are assigned to a struct's fields before the fields of nested types, as in assign_fresh_schema_ids
+    assert fresh_schema == Schema(
+        NestedField(
+            field_id=2,
+            name="location",
+            field_type=StructType(
+                NestedField(field_id=3, name="lat", field_type=DoubleType(), required=False),
+                NestedField(field_id=10, name="alt", field_type=DoubleType(), required=False),
+            ),
+            required=False,
+        ),
+        NestedField(field_id=9, name="extra", field_type=BooleanType(), required=False),
+        NestedField(
+            field_id=4,
+            name="points",
+            field_type=ListType(element_id=5, element_type=LongType(), element_required=False),
+            required=False,
+        ),
+        NestedField(
+            field_id=6,
+            name="tags",
+            field_type=MapType(key_id=7, key_type=StringType(), value_id=8, value_type=StringType(), value_required=False),
+            required=False,
+        ),
+        NestedField(field_id=1, name="id", field_type=LongType(), required=False),
+    )
+
+
+def test_assign_fresh_schema_ids_for_replace_assigns_ids_above_last_column_id() -> None:
+    # "data" with ID 2 was dropped, so it is not in the base schema
+    base_schema = Schema(NestedField(field_id=1, name="id", field_type=LongType(), required=False))
+    schema = Schema(
+        NestedField(field_id=1, name="id", field_type=LongType(), required=False),
+        NestedField(field_id=2, name="data", field_type=StringType(), required=False),
+    )
+
+    fresh_schema = assign_fresh_schema_ids_for_replace(schema, base_schema, last_column_id=2)
+
+    assert fresh_schema == Schema(
+        NestedField(field_id=1, name="id", field_type=LongType(), required=False),
+        NestedField(field_id=3, name="data", field_type=StringType(), required=False),
+    )
+
+
+def _struct(field_id: int, name: str, *fields: NestedField) -> NestedField:
+    return NestedField(field_id=field_id, name=name, field_type=StructType(*fields), required=False)
+
+
+def _long(field_id: int, name: str) -> NestedField:
+    return NestedField(field_id=field_id, name=name, field_type=LongType(), required=False)
+
+
+@pytest.mark.parametrize(
+    "base_schema, schema, expected",
+    [
+        pytest.param(
+            Schema(_struct(1, "a", _long(2, "b"))),
+            Schema(_long(1, "a.b")),
+            Schema(_long(3, "a.b")),
+            id="nested-to-top-level",
+        ),
+        pytest.param(
+            Schema(_long(1, "a.b")),
+            Schema(_struct(1, "a", _long(2, "b"))),
+            Schema(_struct(2, "a", _long(3, "b"))),
+            id="top-level-to-nested",
+        ),
+        pytest.param(
+            Schema(_struct(1, "a", _struct(2, "b", _long(3, "c")))),
+            Schema(_struct(1, "a", _long(2, "b.c"))),
+            Schema(_struct(1, "a", _long(4, "b.c"))),
+            id="nested-to-dotted-nested",
+        ),
+        pytest.param(
+            Schema(_struct(1, "a", _long(2, "b.c"))),
+            Schema(_struct(1, "a", _struct(2, "b", _long(3, "c")))),
+            Schema(_struct(1, "a", _struct(3, "b", _long(4, "c")))),
+            id="dotted-nested-to-nested",
+        ),
+    ],
+)
+def test_assign_fresh_schema_ids_for_replace_matches_parents(base_schema: Schema, schema: Schema, expected: Schema) -> None:
+    fresh_schema = assign_fresh_schema_ids_for_replace(schema, base_schema, last_column_id=base_schema.highest_field_id)
+
+    # Fields with the same full name but a different parent don't keep their IDs
+    assert fresh_schema == expected
+
+
+def test_assign_fresh_schema_ids_for_replace_matches_full_names_only() -> None:
+    base_schema = Schema(
+        NestedField(
+            field_id=1,
+            name="points",
+            field_type=ListType(element_id=2, element_type=StructType(_long(3, "element.x")), element_required=False),
+            required=False,
+        ),
+    )
+    schema = Schema(
+        NestedField(
+            field_id=1,
+            name="points",
+            field_type=ListType(element_id=2, element_type=StructType(_long(3, "x")), element_required=False),
+            required=False,
+        ),
+    )
+
+    fresh_schema = assign_fresh_schema_ids_for_replace(schema, base_schema, last_column_id=3)
+
+    # "points.element.x" is the full name of x and a short name of "element.x" in the base schema, but only full
+    # names are matched
+    assert fresh_schema == Schema(
+        NestedField(
+            field_id=1,
+            name="points",
+            field_type=ListType(element_id=2, element_type=StructType(_long(4, "x")), element_required=False),
             required=False,
         ),
     )
