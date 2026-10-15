@@ -2318,6 +2318,148 @@ DataFrame()
 +---+---+
 ```
 
+## Incremental append scan
+
+`incremental_append_scan()` reads only the rows that were appended to a table between two snapshots, so new data can be processed without reading the whole table again. It doesn't report deletes or updates; see [Only appends are read](#only-appends-are-read).
+
+For example, consider a table with four appends, each of which commits a new snapshot:
+
+```python
+import pyarrow as pa
+from pyiceberg.catalog import load_catalog
+
+catalog = load_catalog("default")
+
+df = pa.Table.from_pylist([{"city": "Amsterdam", "lat": 52.371807, "long": 4.896029}])
+tbl = catalog.create_table("default.cities", schema=df.schema)
+tbl.append(df)
+
+tbl.append(pa.Table.from_pylist([{"city": "San Francisco", "lat": 37.773972, "long": -122.431297}]))
+tbl.append(pa.Table.from_pylist([{"city": "Drachten", "lat": 53.11254, "long": 6.0989}]))
+tbl.append(pa.Table.from_pylist([{"city": "Paris", "lat": 48.864716, "long": 2.349014}]))
+
+snapshot_ids = [snapshot.snapshot_id for snapshot in tbl.snapshots()]
+```
+
+Read the rows appended after the first snapshot, up to and including the third:
+
+```python
+tbl.incremental_append_scan(
+    from_snapshot_id_exclusive=snapshot_ids[0],
+    to_snapshot_id_inclusive=snapshot_ids[2],
+).to_arrow()
+```
+
+This returns the rows of the second and third appends:
+
+```python
+pyarrow.Table
+city: string
+lat: double
+long: double
+----
+city: [["San Francisco"],["Drachten"]]
+lat: [[37.773972],[53.11254]]
+long: [[-122.431297],[6.0989]]
+```
+
+Both snapshot IDs are optional. Without `to_snapshot_id_inclusive`, the scan ends at the table's current snapshot. Without `from_snapshot_id_exclusive`, it starts at the beginning of the end snapshot's history:
+
+```python
+# San Francisco, Drachten and Paris
+tbl.incremental_append_scan(from_snapshot_id_exclusive=snapshot_ids[0]).to_arrow()
+
+# Amsterdam and San Francisco
+tbl.incremental_append_scan(to_snapshot_id_inclusive=snapshot_ids[1]).to_arrow()
+```
+
+The start snapshot must be an ancestor of the end snapshot: an earlier snapshot in its history, not the end snapshot itself. Otherwise, the scan raises a `ValueError`.
+
+To include the start snapshot in the range, call `from_snapshot_id_inclusive()` on the scan instead. This returns the same rows as the first example:
+
+```python
+tbl.incremental_append_scan(
+    to_snapshot_id_inclusive=snapshot_ids[2],
+).from_snapshot_id_inclusive(snapshot_ids[1]).to_arrow()
+```
+
+### Reading new rows since the last run
+
+To process new data as it arrives, save the ID of the snapshot that each run read up to, and start the next run after it:
+
+```python
+# None on the first run, so that every appended row is read
+last_snapshot_id = None
+
+tbl = catalog.load_table("default.cities")
+snapshot = tbl.current_snapshot()
+
+# Skip the scan when nothing was committed since the last run
+if snapshot is not None and snapshot.snapshot_id != last_snapshot_id:
+    new_rows = tbl.incremental_append_scan(
+        from_snapshot_id_exclusive=last_snapshot_id,
+        to_snapshot_id_inclusive=snapshot.snapshot_id,
+    ).to_arrow()
+
+    # Process new_rows, then save the snapshot ID for the next run
+    last_snapshot_id = snapshot.snapshot_id
+```
+
+Without the check, a run with no new commits would raise a `ValueError`, because the start snapshot can't be the end snapshot.
+
+### Filtering and output
+
+`incremental_append_scan()` accepts the same `row_filter`, `selected_fields`, `case_sensitive` and `limit` arguments as `scan()`, and has the same output methods, such as `to_arrow()`, `to_arrow_batch_reader()`, `to_pandas()` and `to_polars()`. See [Query the data](#query-the-data).
+
+```python
+tbl.incremental_append_scan(
+    from_snapshot_id_exclusive=snapshot_ids[0],
+    row_filter="lat > 40.0",
+    selected_fields=("city", "lat"),
+).to_pandas()
+```
+
+This returns the cities appended after the first snapshot with a latitude above 40:
+
+```python
+       city        lat
+0  Drachten  53.112540
+1     Paris  48.864716
+```
+
+<!-- prettier-ignore-start -->
+
+!!! note "Current schema"
+    Rows are read with the table's current schema, even if they were appended before a schema change. A column that was added since reads as `null`.
+
+!!! note "Scan planning"
+    PyIceberg always plans an incremental append scan itself by reading the table's manifests, even when a REST catalog uses server-side scan planning for `scan()`.
+
+<!-- prettier-ignore-end -->
+
+### Only appends are read
+
+An incremental append scan only reads snapshots whose operation is `append`. Snapshots with any other operation (`overwrite`, `delete` or `replace`) are skipped, including any rows they add. This means it isn't a changelog: deletes and updates aren't reported, and rows that were deleted after they were appended are still returned. For example, Paris is still returned after it's deleted:
+
+```python
+tbl.delete(delete_filter="city == 'Paris'")
+
+tbl.incremental_append_scan(from_snapshot_id_exclusive=snapshot_ids[2]).to_arrow()
+```
+
+```python
+pyarrow.Table
+city: string
+lat: double
+long: double
+----
+city: [["Paris"]]
+lat: [[48.864716]]
+long: [[2.349014]]
+```
+
+In PyIceberg, `append()` and `add_files()` commit `append` snapshots, and `delete()` commits `delete` or `overwrite` snapshots. `overwrite()`, `dynamic_partition_overwrite()` and `upsert()` remove the rows they replace in a `delete` or `overwrite` snapshot and write the new rows in an `append` snapshot. The scan returns the new rows but doesn't reflect the removal, so after an `upsert()` it can return both the old and the new version of an updated row.
+
 ## Type mapping
 
 ### PyArrow
