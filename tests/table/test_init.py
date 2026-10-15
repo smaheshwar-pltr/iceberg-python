@@ -587,6 +587,31 @@ def test_incremental_append_scan_staged_table_raises(table_v2: Table) -> None:
         staged_table.incremental_append_scan()
 
 
+def test_incremental_append_scan_dictionary_columns(catalog: Catalog) -> None:
+    import pyarrow as pa
+
+    from pyiceberg.io.pyarrow import schema_to_pyarrow
+
+    catalog.create_namespace("default")
+    schema = Schema(
+        NestedField(1, "id", IntegerType(), required=False),
+        NestedField(2, "label", StringType(), required=False),
+    )
+    table = catalog.create_table("default.incremental_dictionary_columns", schema=schema)
+    for rows in ([(1, "a")], [(2, "b"), (3, "b")], [(4, "a")]):
+        table.append(pa.Table.from_pylist([{"id": i, "label": label} for i, label in rows], schema=schema_to_pyarrow(schema)))
+
+    # Excludes the first append, so the scan spans the files added by the last two.
+    scan = table.incremental_append_scan(from_snapshot_id_exclusive=table.snapshots()[0].snapshot_id)
+    for result in (
+        scan.to_arrow(dictionary_columns=("label",)),
+        scan.to_arrow_batch_reader(dictionary_columns=("label",)).read_all(),
+    ):
+        assert pa.types.is_dictionary(result.schema.field("label").type)
+        assert result.schema.field("id").type == pa.int32()
+        assert sorted(zip(result["id"].to_pylist(), result["label"].to_pylist(), strict=True)) == [(2, "b"), (3, "b"), (4, "a")]
+
+
 def test_static_table_same_as_table(table_v2: Table, metadata_location: str) -> None:
     static_table = StaticTable.from_metadata(metadata_location)
     assert isinstance(static_table, Table)
