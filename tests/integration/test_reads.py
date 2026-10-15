@@ -1491,3 +1491,47 @@ def test_incremental_append_scan_builder_chain(catalog: Catalog) -> None:
         .to_snapshot_id_inclusive(test_table.snapshots()[2].snapshot_id)
     )
     assert sorted(scan.to_arrow()["number"].to_pylist()) == [2, 3, 4]
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("catalog, spark_catalog", [(lf("session_catalog_hive"), "hive"), (lf("session_catalog"), "rest")])
+@pytest.mark.parametrize(
+    "from_index, to_index",
+    [
+        pytest.param(0, 2, id="append_only"),
+        pytest.param(0, 3, id="spans_compaction"),
+        pytest.param(2, 3, id="empty_range"),
+        pytest.param(0, 4, id="spans_delete"),
+        pytest.param(0, 5, id="spans_schema_evolution"),
+    ],
+)
+def test_incremental_append_scan_matches_spark(
+    catalog: Catalog, spark_catalog: str, spark: SparkSession, from_index: int, to_index: int
+) -> None:
+    # Spark's incremental read runs Java's IncrementalAppendScan from an exclusive start to an inclusive end.
+    # These are the ranges of the tests above that Spark can express.
+    test_table = catalog.load_table("default.test_incremental_read")
+    from_id = test_table.snapshots()[from_index].snapshot_id
+    to_id = test_table.snapshots()[to_index].snapshot_id
+
+    pyiceberg_result = test_table.incremental_append_scan(
+        from_snapshot_id_exclusive=from_id,
+        to_snapshot_id_inclusive=to_id,
+    ).to_arrow()
+    spark_df = (
+        spark.read.format("iceberg")
+        .option("start-snapshot-id", str(from_id))
+        .option("end-snapshot-id", str(to_id))
+        .load(f"{spark_catalog}.default.test_incremental_read")
+    )
+
+    # Both project onto the table's current schema.
+    assert pyiceberg_result.column_names == spark_df.columns
+
+    # Compare values, not Arrow types: each engine maps to Arrow independently (e.g. string vs large_string).
+    def sort_key(row: dict[str, Any]) -> list[tuple[bool, Any]]:
+        return [(value is None, value) for value in row.values()]
+
+    pyiceberg_rows = sorted(pyiceberg_result.to_pylist(), key=sort_key)
+    spark_rows = sorted((row.asDict() for row in spark_df.collect()), key=sort_key)
+    assert pyiceberg_rows == spark_rows
