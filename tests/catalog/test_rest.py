@@ -74,7 +74,7 @@ from pyiceberg.table.metadata import TableMetadataV1
 from pyiceberg.table.sorting import SortField, SortOrder
 from pyiceberg.transforms import IdentityTransform, TruncateTransform
 from pyiceberg.typedef import RecursiveDict
-from pyiceberg.types import StringType
+from pyiceberg.types import LongType, NestedField, StringType
 from pyiceberg.utils.config import Config
 from pyiceberg.view import View
 from pyiceberg.view.metadata import ViewMetadata, ViewVersion
@@ -1740,6 +1740,84 @@ def test_create_staged_table_200(
         ],
     }
     assert actual_response == expected
+
+
+def test_replace_table_transaction_200(rest_mock: Mocker, example_table_metadata_v2: dict[str, Any]) -> None:
+    table_json = {"metadata-location": "s3://warehouse/database/table/metadata.json", "metadata": example_table_metadata_v2}
+    rest_mock.get(f"{TEST_URI}v1/namespaces/fokko/tables/fokko2", json=table_json, status_code=200, request_headers=TEST_HEADERS)
+    rest_mock.post(f"{TEST_URI}v1/namespaces/fokko/tables/fokko2", json=table_json, status_code=200, request_headers=TEST_HEADERS)
+    catalog = RestCatalog("rest", uri=TEST_URI, token=TEST_TOKEN)
+
+    catalog.replace_table_transaction(
+        identifier=("fokko", "fokko2"),
+        schema=Schema(
+            NestedField(field_id=1, name="x", field_type=LongType(), required=True),
+            NestedField(field_id=2, name="a", field_type=StringType(), required=False),
+        ),
+        properties={"owner": "pyiceberg"},
+    ).commit_transaction()
+
+    assert rest_mock.last_request.json() == {
+        "identifier": {"namespace": ["fokko"], "name": "fokko2"},
+        "requirements": [
+            {"type": "assert-table-uuid", "uuid": "9c12d441-03fe-4693-9a96-a0705ddf69c1"},
+            {"type": "assert-last-assigned-field-id", "last-assigned-field-id": 3},
+            {"type": "assert-current-schema-id", "current-schema-id": 1},
+            {"type": "assert-last-assigned-partition-id", "last-assigned-partition-id": 1000},
+            {"type": "assert-default-spec-id", "default-spec-id": 0},
+            {"type": "assert-default-sort-order-id", "default-sort-order-id": 3},
+        ],
+        "updates": [
+            {"action": "remove-snapshot-ref", "ref-name": "main"},
+            {
+                "action": "add-schema",
+                "schema": {
+                    "type": "struct",
+                    "fields": [
+                        {"id": 1, "name": "x", "type": "long", "required": True},
+                        {"id": 4, "name": "a", "type": "string", "required": False},
+                    ],
+                    "schema-id": 2,
+                    "identifier-field-ids": [],
+                },
+            },
+            {"action": "set-current-schema", "schema-id": -1},
+            {"action": "add-spec", "spec": {"spec-id": 1, "fields": []}},
+            {"action": "set-default-spec", "spec-id": -1},
+            {"action": "add-sort-order", "sort-order": {"order-id": 0, "fields": []}},
+            {"action": "set-default-sort-order", "sort-order-id": 0},
+            {"action": "set-properties", "updates": {"owner": "pyiceberg"}},
+        ],
+    }
+
+
+def test_replace_table_transaction_with_existing_definition_200(
+    rest_mock: Mocker, example_table_metadata_v2: dict[str, Any]
+) -> None:
+    table_json = {"metadata-location": "s3://warehouse/database/table/metadata.json", "metadata": example_table_metadata_v2}
+    rest_mock.get(f"{TEST_URI}v1/namespaces/fokko/tables/fokko2", json=table_json, status_code=200, request_headers=TEST_HEADERS)
+    rest_mock.post(f"{TEST_URI}v1/namespaces/fokko/tables/fokko2", json=table_json, status_code=200, request_headers=TEST_HEADERS)
+    catalog = RestCatalog("rest", uri=TEST_URI, token=TEST_TOKEN)
+    table = catalog.load_table(("fokko", "fokko2"))
+
+    catalog.replace_table_transaction(
+        identifier=("fokko", "fokko2"),
+        schema=table.schema(),
+        partition_spec=table.spec(),
+        sort_order=table.sort_order(),
+    ).commit_transaction()
+
+    # The current schema, spec and sort order are always set, so that a replace reverts concurrent changes to them
+    assert rest_mock.last_request.json() == {
+        "identifier": {"namespace": ["fokko"], "name": "fokko2"},
+        "requirements": [{"type": "assert-table-uuid", "uuid": "9c12d441-03fe-4693-9a96-a0705ddf69c1"}],
+        "updates": [
+            {"action": "remove-snapshot-ref", "ref-name": "main"},
+            {"action": "set-current-schema", "schema-id": 1},
+            {"action": "set-default-spec", "spec-id": 0},
+            {"action": "set-default-sort-order", "sort-order-id": 3},
+        ],
+    }
 
 
 def test_create_table_409(rest_mock: Mocker, table_schema_simple: Schema) -> None:
