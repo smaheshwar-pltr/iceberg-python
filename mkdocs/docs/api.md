@@ -2326,6 +2326,20 @@ if current is not None and current.snapshot_id != last_snapshot_id:
 
 If the stored snapshot has since been expired, the scan can raise a `ValueError`.
 
+### Reading a branch
+
+By default, the scan reads the history of `main`. Call `use_branch()` to read another branch instead: the end snapshot defaults to the branch head, and an explicit `to_snapshot_id_inclusive` must be an ancestor of it.
+
+```python
+fork_id = table.current_snapshot().snapshot_id
+table.manage_snapshots().create_branch(snapshot_id=fork_id, branch_name="audit").commit()
+table.append(pa.table({"id": [5, 6]}), branch="audit")
+
+audit_rows = table.incremental_append_scan(from_snapshot_id_exclusive=fork_id).use_branch("audit").to_arrow()
+```
+
+To bound the scan by tags, pass their snapshot IDs, for example `from_snapshot_id_exclusive=table.refs()["v1"].snapshot_id`.
+
 ## Type mapping
 
 ### PyArrow
