@@ -854,6 +854,32 @@ def test_table_metadata_writes_reflect_latest_path(
     assert table.location_provider().new_metadata_location("metadata.json") == f"{new_metadata_path}/metadata.json"
 
 
+def test_transaction_writes_manifests_to_staged_metadata_path(
+    catalog: Catalog,
+    test_table_identifier: Identifier,
+    table_schema_simple: Schema,
+    warehouse: Path,
+) -> None:
+    namespace = Catalog.namespace_from(test_table_identifier)
+    catalog.create_namespace(namespace)
+    table = catalog.create_table(identifier=test_table_identifier, schema=table_schema_simple)
+    metadata_path = f"file://{warehouse}/custom/path"
+    df = pa.Table.from_pydict(
+        {"foo": ["a"], "bar": [1], "baz": [True]},
+        schema=schema_to_pyarrow(table_schema_simple),
+    )
+
+    with table.transaction() as txn:
+        txn.set_properties({TableProperties.WRITE_METADATA_PATH: metadata_path})
+        txn.append(df)
+
+    snapshot = table.current_snapshot()
+    assert snapshot is not None
+    assert snapshot.manifest_list.startswith(metadata_path)
+    assert all(manifest.manifest_path.startswith(metadata_path) for manifest in snapshot.manifests(table.io))
+    assert table.metadata_location.startswith(metadata_path)
+
+
 @pytest.mark.parametrize("format_version", [1, 2])
 def test_write_and_evolve(catalog: Catalog, format_version: int) -> None:
     identifier = f"default.arrow_write_data_and_evolve_schema_v{format_version}"
