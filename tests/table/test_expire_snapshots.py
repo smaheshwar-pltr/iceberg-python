@@ -19,8 +19,10 @@ from datetime import datetime, timedelta
 from unittest.mock import MagicMock, Mock
 from uuid import uuid4
 
+import pyarrow as pa
 import pytest
 
+from pyiceberg.catalog import Catalog
 from pyiceberg.table import CommitTableResponse, Table
 from pyiceberg.table.update import RemoveSnapshotsUpdate, update_table_metadata
 from pyiceberg.table.update.snapshot import ExpireSnapshots
@@ -316,3 +318,22 @@ def test_update_remove_snapshots_with_statistics(table_v2_with_statistics: Table
     assert not any(stat.snapshot_id == REMOVE_SNAPSHOT for stat in new_metadata.statistics), (
         "Statistics for removed snapshot should be gone"
     )
+
+
+def test_expire_snapshots_keeps_parent_of_retained_snapshot(catalog: Catalog) -> None:
+    """Test that a retained snapshot keeps its expired parent's ID, so incremental scans can start from it."""
+    catalog.create_namespace("default")
+    tbl = catalog.create_table("default.expire_keeps_parent", schema=pa.schema([pa.field("x", pa.int64())]))
+    for x in [1, 2, 3]:
+        tbl.append(pa.table({"x": [x]}))
+    _, expired_snapshot_id, child_snapshot_id = [snapshot.snapshot_id for snapshot in tbl.metadata.snapshots]
+
+    tbl.maintenance.expire_snapshots().by_id(expired_snapshot_id).commit()
+
+    tbl = catalog.load_table("default.expire_keeps_parent")
+    assert tbl.snapshot_by_id(expired_snapshot_id) is None
+    child_snapshot = tbl.snapshot_by_id(child_snapshot_id)
+    assert child_snapshot is not None
+    assert child_snapshot.parent_snapshot_id == expired_snapshot_id
+    result = tbl.incremental_append_scan(from_snapshot_id_exclusive=expired_snapshot_id).to_arrow()
+    assert result["x"].to_pylist() == [3]
