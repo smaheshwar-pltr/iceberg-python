@@ -16,8 +16,10 @@
 # under the License.
 from __future__ import annotations
 
+import itertools
 import uuid
 from abc import ABC, abstractmethod
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import date, datetime, time
 from functools import cached_property, singledispatch
@@ -47,7 +49,7 @@ from pyiceberg.transforms import (
     YearTransform,
     parse_transform,
 )
-from pyiceberg.typedef import IcebergBaseModel, Record
+from pyiceberg.typedef import IcebergBaseModel, Record, TableVersion
 from pyiceberg.types import (
     DateType,
     IcebergType,
@@ -337,6 +339,74 @@ def assign_fresh_partition_spec_ids(spec: PartitionSpec, old_schema: Schema, fre
                 transform=field.transform,
             )
         )
+    return PartitionSpec(*partition_fields, spec_id=INITIAL_PARTITION_SPEC_ID)
+
+
+def assign_fresh_partition_spec_ids_for_replace(
+    spec: PartitionSpec,
+    old_schema: Schema,
+    fresh_schema: Schema,
+    format_version: TableVersion,
+    current_spec: PartitionSpec,
+    specs: Iterable[PartitionSpec],
+    last_partition_id: int,
+) -> PartitionSpec:
+    """Assign partition field IDs to a spec that replaces the current spec of a table.
+
+    The source IDs are rebound from `old_schema` to `fresh_schema` by column name.
+
+    From format version 2, a field reuses the ID of a field with the same source and transform
+    in any of `specs`. In format version 1, partition fields can't be removed, so every field of
+    `current_spec` is carried forward: a field with the same source and transform in `spec` takes
+    over its ID, and the others are replaced by void transforms. All other fields get fresh IDs
+    above `last_partition_id`.
+
+    Args:
+        spec: The replacement spec, with source IDs referencing `old_schema`.
+        old_schema: The schema that `spec` references.
+        fresh_schema: The replacement schema with its final field IDs.
+        format_version: The format version of the table being replaced.
+        current_spec: The current spec of the table, with source IDs referencing its current schema.
+        specs: All the specs of the table.
+        last_partition_id: The highest partition field ID assigned so far.
+
+    Returns:
+        The replacement spec with the new partition field IDs.
+    """
+    fresh_spec = assign_fresh_partition_spec_ids(spec, old_schema, fresh_schema)
+    new_field_ids = itertools.count(last_partition_id + 1)
+    partition_fields = []
+    if format_version > 1:
+        field_ids: dict[tuple[int, str], int] = {}
+        for existing_spec in specs:
+            for field in existing_spec.fields:
+                key = (field.source_id, str(field.transform))
+                field_ids[key] = max(field.field_id, field_ids.get(key, field.field_id))
+
+        for field in fresh_spec.fields:
+            key = (field.source_id, str(field.transform))
+            if key not in field_ids:
+                field_ids[key] = next(new_field_ids)
+            partition_fields.append(PartitionField(field.source_id, field_ids[key], field.transform, field.name))
+    else:
+        new_fields = {(field.source_id, str(field.transform)): field for field in fresh_spec.fields}
+        new_field_names = {field.name for field in new_fields.values()}
+        for field in current_spec.fields:
+            if (new_field := new_fields.pop((field.source_id, str(field.transform)), None)) is not None:
+                partition_fields.append(PartitionField(new_field.source_id, field.field_id, new_field.transform, new_field.name))
+            else:
+                # Rename the void field if a new field takes its name
+                void_name = f"{field.name}_{field.field_id}" if field.name in new_field_names else field.name
+                validate_partition_name(void_name, VoidTransform(), field.source_id, fresh_schema, set())
+                partition_fields.append(PartitionField(field.source_id, field.field_id, VoidTransform(), void_name))
+
+        for new_field in new_fields.values():
+            partition_fields.append(PartitionField(new_field.source_id, next(new_field_ids), new_field.transform, new_field.name))
+
+    names = [field.name for field in partition_fields]
+    if duplicates := {name for name in names if names.count(name) > 1}:
+        raise ValueError(f"Partition field names must be unique, found duplicates: {sorted(duplicates)}")
+
     return PartitionSpec(*partition_fields, spec_id=INITIAL_PARTITION_SPEC_ID)
 
 

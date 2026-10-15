@@ -42,11 +42,11 @@ from pyiceberg.exceptions import (
 from pyiceberg.io.pyarrow import _dataframe_to_data_files, schema_to_pyarrow
 from pyiceberg.partitioning import UNPARTITIONED_PARTITION_SPEC, PartitionField, PartitionSpec
 from pyiceberg.schema import Schema
-from pyiceberg.table import TableProperties
+from pyiceberg.table import Table, TableProperties
 from pyiceberg.table.snapshots import Operation
-from pyiceberg.table.sorting import NullOrder, SortDirection, SortField, SortOrder
+from pyiceberg.table.sorting import UNSORTED_SORT_ORDER, NullOrder, SortDirection, SortField, SortOrder
 from pyiceberg.table.update import AddSchemaUpdate, SetCurrentSchemaUpdate
-from pyiceberg.transforms import IdentityTransform
+from pyiceberg.transforms import BucketTransform, IdentityTransform, VoidTransform
 from pyiceberg.typedef import Identifier
 from pyiceberg.types import BooleanType, DoubleType, IntegerType, LongType, NestedField, StringType
 
@@ -185,6 +185,319 @@ def test_create_table_transaction(catalog: Catalog, format_version: int) -> None
     tbl = catalog.load_table(identifier=identifier)
     assert tbl.format_version == format_version
     assert len(tbl.scan().to_arrow()) == 6
+
+
+REPLACE_TABLE_SCHEMA = Schema(
+    NestedField(field_id=1, name="id", field_type=LongType(), required=False),
+    NestedField(field_id=2, name="data", field_type=StringType(), required=False),
+)
+
+
+def _create_table_to_replace(catalog: Catalog, identifier: Identifier, **kwargs: Any) -> Table:
+    catalog.create_namespace_if_not_exists(Catalog.namespace_from(identifier))
+    return catalog.create_table(identifier, REPLACE_TABLE_SCHEMA, **kwargs)
+
+
+def _rows(schema: Schema, *ids: int) -> pa.Table:
+    return pa.Table.from_pylist([{"id": i, "data": str(i)} for i in ids], schema=schema.as_arrow())
+
+
+def test_replace_table_transaction(catalog: Catalog, test_table_identifier: Identifier) -> None:
+    table = _create_table_to_replace(catalog, test_table_identifier)
+    table.append(_rows(table.schema(), 1, 2))
+    original_snapshot = table.current_snapshot()
+    assert original_snapshot is not None
+
+    # Reorder the columns and add one, from PyArrow so that the schema has no field IDs
+    schema = pa.schema([pa.field("data", pa.large_string()), pa.field("extra", pa.bool_()), pa.field("id", pa.int64())])
+    txn = catalog.replace_table_transaction(test_table_identifier, schema=schema)
+    txn.append(pa.Table.from_pylist([{"data": "3", "extra": True, "id": 3}], schema=schema))
+    assert catalog.load_table(test_table_identifier).metadata == table.metadata
+
+    replaced = txn.commit_transaction()
+
+    assert replaced.metadata == catalog.load_table(test_table_identifier).metadata
+    assert replaced.metadata.table_uuid == table.metadata.table_uuid
+    assert replaced.location() == table.location()
+    assert replaced.schema().schema_id == 1
+    assert replaced.schema() == Schema(
+        NestedField(field_id=2, name="data", field_type=StringType(), required=False),
+        NestedField(field_id=3, name="extra", field_type=BooleanType(), required=False),
+        NestedField(field_id=1, name="id", field_type=LongType(), required=False),
+    )
+    snapshot = replaced.current_snapshot()
+    assert snapshot is not None
+    assert snapshot.parent_snapshot_id is None
+    assert [entry.snapshot_id for entry in replaced.history()] == [original_snapshot.snapshot_id, snapshot.snapshot_id]
+    assert len(replaced.metadata.metadata_log) == len(table.metadata.metadata_log) + 1
+    assert replaced.scan().to_arrow().to_pylist() == [{"data": "3", "extra": True, "id": 3}]
+    assert replaced.scan(snapshot_id=original_snapshot.snapshot_id).to_arrow().to_pylist() == [
+        {"id": 1, "data": "1"},
+        {"id": 2, "data": "2"},
+    ]
+
+
+def test_replace_table_transaction_with_all_arguments(
+    catalog: Catalog, test_table_identifier: Identifier, tmp_path: Path
+) -> None:
+    table = _create_table_to_replace(catalog, test_table_identifier, properties={"keep": "a", "override": "b"})
+    table.append(_rows(table.schema(), 1))
+    location = f"file://{tmp_path}/replaced"
+
+    txn = catalog.replace_table_transaction(
+        test_table_identifier,
+        schema=REPLACE_TABLE_SCHEMA,
+        location=f"{location}/",
+        partition_spec=PartitionSpec(PartitionField(source_id=2, field_id=1000, transform=IdentityTransform(), name="data")),
+        sort_order=SortOrder(SortField(source_id=1, transform=IdentityTransform(), direction=SortDirection.DESC)),
+        properties={"override": "c", "new": "d"},
+    )
+    txn.append(_rows(REPLACE_TABLE_SCHEMA, 2))
+    assert catalog.load_table(test_table_identifier).metadata == table.metadata
+
+    replaced = txn.commit_transaction()
+
+    assert replaced.spec() == PartitionSpec(
+        PartitionField(source_id=2, field_id=1000, transform=IdentityTransform(), name="data"), spec_id=1
+    )
+    assert replaced.sort_order() == SortOrder(
+        SortField(source_id=1, transform=IdentityTransform(), direction=SortDirection.DESC, null_order=NullOrder.NULLS_LAST),
+        order_id=1,
+    )
+    assert replaced.properties == {"keep": "a", "override": "c", "new": "d"}
+    assert replaced.location() == location
+    snapshot = replaced.current_snapshot()
+    assert snapshot is not None
+    assert snapshot.manifest_list.startswith(location)
+    assert all(task.file.file_path.startswith(location) for task in replaced.scan().plan_files())
+    assert replaced.metadata_location.startswith(location)
+    assert replaced.scan().to_arrow().to_pylist() == [{"id": 2, "data": "2"}]
+
+
+def test_replace_table_transaction_requires_table_exists(catalog: Catalog) -> None:
+    catalog.create_namespace("default")
+
+    with pytest.raises(NoSuchTableError, match="Table does not exist: default.missing"):
+        catalog.replace_table_transaction(("default", "missing"), schema=REPLACE_TABLE_SCHEMA)
+
+
+def test_replace_table_transaction_without_writes(catalog: Catalog, test_table_identifier: Identifier) -> None:
+    table = _create_table_to_replace(catalog, test_table_identifier)
+    table.append(_rows(table.schema(), 1))
+    snapshot = table.current_snapshot()
+    assert snapshot is not None
+    table.manage_snapshots().create_tag(snapshot.snapshot_id, "tag").create_branch(snapshot.snapshot_id, "branch").commit()
+
+    replaced = catalog.replace_table_transaction(test_table_identifier, schema=REPLACE_TABLE_SCHEMA).commit_transaction()
+
+    # Only the main branch is removed
+    assert replaced.current_snapshot() is None
+    assert set(replaced.refs()) == {"tag", "branch"}
+    assert replaced.snapshots() == table.snapshots()
+    assert replaced.scan().to_arrow().num_rows == 0
+
+
+def test_replace_table_transaction_reuses_schema(catalog: Catalog, test_table_identifier: Identifier) -> None:
+    _create_table_to_replace(catalog, test_table_identifier)
+    schema_with_extra = Schema(
+        *REPLACE_TABLE_SCHEMA.fields, NestedField(field_id=3, name="extra", field_type=BooleanType(), required=False)
+    )
+    catalog.replace_table_transaction(test_table_identifier, schema=schema_with_extra).commit_transaction()
+
+    replaced = catalog.replace_table_transaction(test_table_identifier, schema=REPLACE_TABLE_SCHEMA).commit_transaction()
+
+    assert replaced.schema().schema_id == 0
+    assert [schema.schema_id for schema in replaced.metadata.schemas] == [0, 1]
+    assert replaced.metadata.last_column_id == 3
+
+
+def test_replace_table_transaction_reuses_partition_specs_and_sort_orders(
+    catalog: Catalog, test_table_identifier: Identifier
+) -> None:
+    spec = PartitionSpec(PartitionField(source_id=1, field_id=1000, transform=IdentityTransform(), name="id"))
+    sort_order = SortOrder(SortField(source_id=1, transform=IdentityTransform()))
+    _create_table_to_replace(catalog, test_table_identifier, partition_spec=spec, sort_order=sort_order)
+
+    # The table was created sorted, so it has no unsorted order yet
+    replaced = catalog.replace_table_transaction(test_table_identifier, schema=REPLACE_TABLE_SCHEMA).commit_transaction()
+    assert replaced.spec() == PartitionSpec(spec_id=1)
+    assert replaced.sort_order() == UNSORTED_SORT_ORDER
+    assert [sort_order.order_id for sort_order in replaced.metadata.sort_orders] == [1, 0]
+
+    replaced = catalog.replace_table_transaction(
+        test_table_identifier,
+        schema=REPLACE_TABLE_SCHEMA,
+        partition_spec=PartitionSpec(
+            PartitionField(source_id=1, field_id=1000, transform=IdentityTransform(), name="id"),
+            PartitionField(source_id=2, field_id=1001, transform=BucketTransform(4), name="data_bucket"),
+        ),
+        sort_order=sort_order,
+    ).commit_transaction()
+    assert replaced.spec() == PartitionSpec(
+        PartitionField(source_id=1, field_id=1000, transform=IdentityTransform(), name="id"),
+        PartitionField(source_id=2, field_id=1001, transform=BucketTransform(4), name="data_bucket"),
+        spec_id=2,
+    )
+    assert replaced.sort_order().order_id == 1
+
+    replaced = catalog.replace_table_transaction(
+        test_table_identifier, schema=REPLACE_TABLE_SCHEMA, partition_spec=spec
+    ).commit_transaction()
+    assert replaced.spec().spec_id == 0
+    assert replaced.metadata.last_partition_id == 1001
+    assert replaced.sort_order().order_id == 0
+
+
+@pytest.mark.parametrize(
+    "properties",
+    [pytest.param({}, id="v1"), pytest.param({TableProperties.FORMAT_VERSION: "2"}, id="upgrade-to-v2")],
+)
+def test_replace_v1_table_transaction(catalog: Catalog, test_table_identifier: Identifier, properties: dict[str, str]) -> None:
+    _create_table_to_replace(
+        catalog,
+        test_table_identifier,
+        partition_spec=PartitionSpec(PartitionField(source_id=1, field_id=1000, transform=IdentityTransform(), name="id")),
+        properties={TableProperties.FORMAT_VERSION: "1"},
+    )
+
+    replaced = catalog.replace_table_transaction(
+        test_table_identifier,
+        schema=REPLACE_TABLE_SCHEMA,
+        partition_spec=PartitionSpec(
+            PartitionField(source_id=2, field_id=1000, transform=BucketTransform(4), name="data_bucket")
+        ),
+        properties=properties,
+    ).commit_transaction()
+
+    assert replaced.format_version == int(properties.get(TableProperties.FORMAT_VERSION, 1))
+    assert TableProperties.FORMAT_VERSION not in replaced.properties
+    # The spec follows the v1 rules of the replaced table, so the removed field is carried forward as void
+    assert replaced.spec() == PartitionSpec(
+        PartitionField(source_id=1, field_id=1000, transform=VoidTransform(), name="id"),
+        PartitionField(source_id=2, field_id=1001, transform=BucketTransform(4), name="data_bucket"),
+        spec_id=1,
+    )
+
+
+@pytest.mark.parametrize(
+    "format_version, message",
+    [("1", "Cannot downgrade v2 table to v1"), ("3", "Unsupported table format version: 3")],
+)
+def test_replace_table_transaction_rejects_format_version(
+    catalog: Catalog, test_table_identifier: Identifier, format_version: str, message: str
+) -> None:
+    _create_table_to_replace(catalog, test_table_identifier)
+
+    with pytest.raises(ValueError, match=message):
+        catalog.replace_table_transaction(
+            test_table_identifier, schema=REPLACE_TABLE_SCHEMA, properties={TableProperties.FORMAT_VERSION: format_version}
+        )
+
+
+REPLACE_TABLE_SCHEMA_WITH_EXTRA = Schema(
+    *REPLACE_TABLE_SCHEMA.fields, NestedField(field_id=3, name="extra", field_type=BooleanType(), required=False)
+)
+REPLACE_TABLE_SPEC = PartitionSpec(PartitionField(source_id=1, field_id=1000, transform=IdentityTransform(), name="id"))
+
+
+@pytest.mark.parametrize(
+    "first_replace, second_replace",
+    [
+        pytest.param({}, {}, id="unchanged"),
+        pytest.param({"schema": REPLACE_TABLE_SCHEMA_WITH_EXTRA}, {}, id="schema-first"),
+        pytest.param({}, {"schema": REPLACE_TABLE_SCHEMA_WITH_EXTRA}, id="schema-second"),
+        pytest.param({"partition_spec": REPLACE_TABLE_SPEC}, {}, id="spec-first"),
+        pytest.param({}, {"partition_spec": REPLACE_TABLE_SPEC}, id="spec-second"),
+        pytest.param({"sort_order": SortOrder(SortField(source_id=1))}, {}, id="sort-order-first"),
+    ],
+)
+def test_concurrent_replace_table_transactions(
+    catalog: Catalog, test_table_identifier: Identifier, first_replace: dict[str, Any], second_replace: dict[str, Any]
+) -> None:
+    table = _create_table_to_replace(catalog, test_table_identifier)
+    table.append(_rows(table.schema(), 1))
+    second = catalog.replace_table_transaction(test_table_identifier, **{"schema": REPLACE_TABLE_SCHEMA, **second_replace})
+    second.append(_rows(second.table_metadata.schema(), 3))
+    expected = second.table_metadata
+
+    first = catalog.replace_table_transaction(test_table_identifier, **{"schema": REPLACE_TABLE_SCHEMA, **first_replace})
+    first.append(_rows(first.table_metadata.schema(), 2))
+    first.commit_transaction()
+    second.commit_transaction()
+
+    # The last replace wins, also reverting the definition of the first
+    replaced = catalog.load_table(test_table_identifier)
+    assert replaced.schema().schema_id == expected.current_schema_id
+    assert replaced.schema() == expected.schema()
+    assert replaced.spec() == expected.spec()
+    assert replaced.sort_order() == expected.sort_order()
+    assert replaced.scan().to_arrow().to_pylist() == _rows(expected.schema(), 3).to_pylist()
+
+
+@pytest.mark.parametrize(
+    "create, first_replace, second_replace, message",
+    [
+        pytest.param(
+            {},
+            {"schema": REPLACE_TABLE_SCHEMA_WITH_EXTRA},
+            {"schema": REPLACE_TABLE_SCHEMA_WITH_EXTRA},
+            "last assigned field id has changed",
+            id="schema-with-new-field",
+        ),
+        pytest.param(
+            {},
+            {"schema": Schema(REPLACE_TABLE_SCHEMA.fields[0])},
+            {"schema": Schema(REPLACE_TABLE_SCHEMA.fields[1])},
+            "current schema id has changed",
+            id="schema",
+        ),
+        pytest.param(
+            {},
+            {"partition_spec": REPLACE_TABLE_SPEC},
+            {"partition_spec": REPLACE_TABLE_SPEC},
+            "last assigned partition id has changed",
+            id="spec-with-new-field",
+        ),
+        pytest.param(
+            {"partition_spec": REPLACE_TABLE_SPEC},
+            {},
+            {},
+            "default spec id has changed",
+            id="spec",
+        ),
+        pytest.param(
+            {},
+            {"sort_order": SortOrder(SortField(source_id=1))},
+            {"sort_order": SortOrder(SortField(source_id=2))},
+            "default sort order id has changed",
+            id="sort-order",
+        ),
+    ],
+)
+def test_concurrent_replace_table_transactions_conflict(
+    catalog: Catalog,
+    test_table_identifier: Identifier,
+    create: dict[str, Any],
+    first_replace: dict[str, Any],
+    second_replace: dict[str, Any],
+    message: str,
+) -> None:
+    _create_table_to_replace(catalog, test_table_identifier, **create)
+    second = catalog.replace_table_transaction(test_table_identifier, **{"schema": REPLACE_TABLE_SCHEMA, **second_replace})
+    second.append(_rows(second.table_metadata.schema(), 2))
+    first = catalog.replace_table_transaction(test_table_identifier, **{"schema": REPLACE_TABLE_SCHEMA, **first_replace})
+    first.append(_rows(first.table_metadata.schema(), 1))
+    replaced = first.commit_transaction()
+    manifest_list = second.table_metadata.snapshots[-1].manifest_list
+
+    # Both replaces add a schema, spec or sort order with the same ID
+    with pytest.raises(CommitFailedException, match=message):
+        second.commit_transaction()
+
+    assert catalog.load_table(test_table_identifier).metadata == replaced.metadata
+    assert not os.path.exists(manifest_list.removeprefix("file://"))
+    with pytest.raises(RuntimeError, match="This transaction failed to commit and cannot be reused"):
+        second.commit_transaction()
 
 
 def test_create_table_default_sort_order(
@@ -801,6 +1114,32 @@ def test_table_metadata_writes_reflect_latest_path(
     table.transaction().set_properties({TableProperties.WRITE_METADATA_PATH: new_metadata_path}).commit_transaction()
 
     assert table.location_provider().new_metadata_location("metadata.json") == f"{new_metadata_path}/metadata.json"
+
+
+def test_transaction_writes_manifests_to_staged_metadata_path(
+    catalog: Catalog,
+    test_table_identifier: Identifier,
+    table_schema_simple: Schema,
+    warehouse: Path,
+) -> None:
+    namespace = Catalog.namespace_from(test_table_identifier)
+    catalog.create_namespace(namespace)
+    table = catalog.create_table(identifier=test_table_identifier, schema=table_schema_simple)
+    metadata_path = f"file://{warehouse}/custom/path"
+    df = pa.Table.from_pydict(
+        {"foo": ["a"], "bar": [1], "baz": [True]},
+        schema=schema_to_pyarrow(table_schema_simple),
+    )
+
+    with table.transaction() as txn:
+        txn.set_properties({TableProperties.WRITE_METADATA_PATH: metadata_path})
+        txn.append(df)
+
+    snapshot = table.current_snapshot()
+    assert snapshot is not None
+    assert snapshot.manifest_list.startswith(metadata_path)
+    assert all(manifest.manifest_path.startswith(metadata_path) for manifest in snapshot.manifests(table.io))
+    assert table.metadata_location.startswith(metadata_path)
 
 
 @pytest.mark.parametrize("format_version", [1, 2])
