@@ -2281,6 +2281,51 @@ DataFrame()
 +---+---+
 ```
 
+## Incremental append scan
+
+`incremental_append_scan()` reads the rows added by `append` snapshots between two snapshots, for example to process only the data appended since a previous run. Other snapshots (`overwrite`, `delete`, and `replace` from compaction) are skipped, so this is not a changelog scan: rows deleted or overwritten later are still returned, and compacted rows are not returned twice. PyIceberg's `overwrite()`, `dynamic_partition_overwrite()` and `upsert()` commit their new rows in a separate `append` snapshot, so those rows are returned.
+
+```python
+import pyarrow as pa
+
+table = catalog.create_table("default.events", schema=pa.schema([pa.field("id", pa.int64())]))
+
+table.append(pa.table({"id": [1, 2]}))
+start_id = table.current_snapshot().snapshot_id
+table.append(pa.table({"id": [3, 4]}))
+table.delete("id == 3")
+
+table.incremental_append_scan(from_snapshot_id_exclusive=start_id).to_arrow()["id"].to_pylist()
+# [3, 4]: id 3 is returned even though it was deleted
+```
+
+The scan covers the snapshot range `(from, to]`:
+
+- `to_snapshot_id_inclusive` defaults to the table's current snapshot.
+- `from_snapshot_id_exclusive` excludes the start snapshot; use `.from_snapshot_id_inclusive(snapshot_id)` on the scan to include it.
+- Without a start, the scan begins at the oldest ancestor of the end snapshot, which is not necessarily the table's first snapshot (for example after snapshots were expired).
+- The start must be an ancestor of the end snapshot, and an exclusive start cannot be the end snapshot itself; otherwise the scan raises a `ValueError`.
+
+Rows are read with the table's current schema. `row_filter`, `selected_fields`, `case_sensitive` and `limit` work as in `scan()`, and results are read with `to_arrow()`, `to_arrow_batch_reader()`, `to_pandas()` and the other `to_*` methods. Planning always happens client-side, even if the REST catalog requests server-side scan planning.
+
+A consumer can store the ID of the last snapshot it read and start the next scan after it:
+
+```python
+last_snapshot_id = load_checkpoint()  # None on the first run
+
+table = catalog.load_table("default.events")
+current = table.current_snapshot()
+if current is not None and current.snapshot_id != last_snapshot_id:
+    new_rows = table.incremental_append_scan(
+        from_snapshot_id_exclusive=last_snapshot_id,
+        to_snapshot_id_inclusive=current.snapshot_id,
+    ).to_arrow_batch_reader()
+    process(new_rows)
+    save_checkpoint(current.snapshot_id)
+```
+
+If the stored snapshot has since been expired, the scan can raise a `ValueError`.
+
 ## Type mapping
 
 ### PyArrow
