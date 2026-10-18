@@ -377,6 +377,11 @@ class Schema(IcebergBaseModel):
                     f"{field.field_type} is only supported in {field.field_type.minimum_format_version()} or higher. "
                     f"Current format version is: {format_version}"
                 )
+            if field.initial_default is not None and format_version < 3:
+                raise ValueError(
+                    f"Initial default of {self.find_column_name(field.field_id)} is only supported in 3 or higher. "
+                    f"Current format version is: {format_version}"
+                )
 
 
 class SchemaVisitor(Generic[T], ABC):
@@ -1347,6 +1352,8 @@ class _SetFreshIDs(PreOrderSchemaVisitor[IcebergType]):
                     field_type=field_type(),
                     required=field.required,
                     doc=field.doc,
+                    initial_default=field.initial_default,
+                    write_default=field.write_default,
                 )
             )
         return StructType(*new_fields)

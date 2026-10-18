@@ -20,7 +20,7 @@ Consolidated behavior tests for InMemoryCatalog and SqlCatalog.
 """
 
 import os
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from pathlib import Path
 from typing import Any
 
@@ -46,9 +46,10 @@ from pyiceberg.table import TableProperties
 from pyiceberg.table.snapshots import Operation
 from pyiceberg.table.sorting import NullOrder, SortDirection, SortField, SortOrder
 from pyiceberg.table.update import AddSchemaUpdate, SetCurrentSchemaUpdate
+from pyiceberg.table.update.schema import UpdateSchema
 from pyiceberg.transforms import IdentityTransform
 from pyiceberg.typedef import Identifier
-from pyiceberg.types import BooleanType, DoubleType, IntegerType, LongType, NestedField, StringType
+from pyiceberg.types import BooleanType, DoubleType, IntegerType, LongType, NestedField, StringType, StructType
 
 
 # Name parsing tests
@@ -84,6 +85,56 @@ def test_create_table(catalog: Catalog, test_table_identifier: Identifier, table
     loaded = catalog.load_table(test_table_identifier)
     assert loaded.name() == table.name()
     assert loaded.metadata_location == table.metadata_location
+
+
+def test_create_table_keeps_write_default(catalog: Catalog, test_table_identifier: Identifier) -> None:
+    catalog.create_namespace(Catalog.namespace_from(test_table_identifier))
+    schema = Schema(NestedField(field_id=1, name="id", field_type=LongType(), required=False, write_default=2))
+
+    table = catalog.create_table(test_table_identifier, schema)
+
+    assert catalog.load_table(test_table_identifier).schema() == table.schema() == schema
+
+
+_STRUCT_WITH_INITIAL_DEFAULT = StructType(
+    NestedField(field_id=100, name="child", field_type=LongType(), required=False, initial_default=7, write_default=9)
+)
+
+
+@pytest.mark.parametrize(
+    "update",
+    [
+        pytest.param(lambda update: update.add_column("extra", LongType(), default_value=7), id="add-column"),
+        pytest.param(lambda update: update.add_column("extra", _STRUCT_WITH_INITIAL_DEFAULT), id="add-struct-column"),
+        pytest.param(
+            lambda update: update.union_by_name(
+                Schema(NestedField(field_id=2, name="extra", field_type=_STRUCT_WITH_INITIAL_DEFAULT, required=False))
+            ),
+            id="union-by-name",
+        ),
+    ],
+)
+def test_update_schema_rejects_initial_default_before_v3(
+    catalog: Catalog, test_table_identifier: Identifier, update: Callable[[UpdateSchema], UpdateSchema]
+) -> None:
+    catalog.create_namespace(Catalog.namespace_from(test_table_identifier))
+    table = catalog.create_table(test_table_identifier, Schema(NestedField(field_id=1, name="id", field_type=LongType())))
+
+    with pytest.raises(ValueError, match="Cannot add column extra: initial defaults are only supported in format version 3"):
+        update(table.update_schema()).commit()
+
+    assert catalog.load_table(test_table_identifier).schema() == table.schema()
+
+
+def test_update_schema_keeps_write_default_before_v3(catalog: Catalog, test_table_identifier: Identifier) -> None:
+    catalog.create_namespace(Catalog.namespace_from(test_table_identifier))
+    table = catalog.create_table(test_table_identifier, Schema(NestedField(field_id=1, name="id", field_type=LongType())))
+    struct_type = StructType(NestedField(field_id=100, name="child", field_type=LongType(), required=False, write_default=9))
+
+    table.update_schema().add_column("extra", struct_type).commit()
+
+    child = catalog.load_table(test_table_identifier).schema().find_field("extra.child")
+    assert (child.initial_default, child.write_default) == (None, 9)
 
 
 def test_create_table_if_not_exists_duplicated_table(
