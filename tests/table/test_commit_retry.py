@@ -24,6 +24,7 @@ from pyiceberg.catalog import Catalog
 from pyiceberg.exceptions import CommitFailedException, CommitStateUnknownException, ValidationException
 from pyiceberg.schema import Schema
 from pyiceberg.table import TableProperties, Transaction
+from pyiceberg.table.refs import MAIN_BRANCH
 from pyiceberg.table.snapshots import IsolationLevel, Operation
 from pyiceberg.types import LongType, NestedField, StringType
 
@@ -957,6 +958,103 @@ def test_commit_retry_delete_on_non_main_branch(catalog: Catalog) -> None:
     assert sorted(result.column("x").to_pylist()) == [2, 3, 4, 5, 6, 7, 8, 9]
 
 
+@pytest.mark.parametrize("format_version", [1, 2])
+def test_transaction_retries_concurrent_commit_to_second_branch(catalog: Catalog, format_version: int) -> None:
+    """A concurrent commit to any branch a transaction writes, not just the first, is kept rather than overwritten."""
+    import pyarrow as pa
+
+    catalog.create_namespace("default")
+    table = catalog.create_table(
+        "default.two_branch_retry_test", schema=_test_schema(), properties={"format-version": str(format_version)}
+    )
+    table.append(pa.table({"x": [1]}))
+    assert table.metadata.current_snapshot_id is not None
+    table.manage_snapshots().create_branch(snapshot_id=table.metadata.current_snapshot_id, branch_name="test-branch").commit()
+
+    tx = catalog.load_table("default.two_branch_retry_test").transaction()
+    tx.append(pa.table({"x": [2]}))
+    tx.append(pa.table({"x": [3]}), branch="test-branch")
+
+    catalog.load_table("default.two_branch_retry_test").append(pa.table({"x": [4]}), branch="test-branch")
+    tx.commit_transaction()
+
+    refreshed = catalog.load_table("default.two_branch_retry_test")
+    assert sorted(refreshed.scan().to_arrow().column("x").to_pylist()) == [1, 2]
+    assert sorted(refreshed.scan().use_ref("test-branch").to_arrow().column("x").to_pylist()) == [1, 3, 4]
+
+
+def test_transaction_validates_each_branch_against_its_own_concurrent_commits(catalog: Catalog) -> None:
+    """On retry, an overwrite of a branch is validated against the commits to that branch only."""
+    import pyarrow as pa
+
+    catalog.create_namespace("default")
+    table = catalog.create_table("default.two_branch_validate_test", schema=_test_schema())
+    table.append(pa.table({"x": [1]}))
+    assert table.metadata.current_snapshot_id is not None
+    table.manage_snapshots().create_branch(snapshot_id=table.metadata.current_snapshot_id, branch_name="test-branch").commit()
+
+    # A concurrent append to main does not conflict with the overwrite of the branch
+    tx = catalog.load_table("default.two_branch_validate_test").transaction()
+    tx.append(pa.table({"x": [2]}))
+    tx.overwrite(pa.table({"x": [3]}), branch="test-branch")
+    catalog.load_table("default.two_branch_validate_test").append(pa.table({"x": [4]}))
+    tx.commit_transaction()
+
+    refreshed = catalog.load_table("default.two_branch_validate_test")
+    assert sorted(refreshed.scan().to_arrow().column("x").to_pylist()) == [1, 2, 4]
+    assert sorted(refreshed.scan().use_ref("test-branch").to_arrow().column("x").to_pylist()) == [3]
+
+    # A concurrent append to the branch does
+    tx = catalog.load_table("default.two_branch_validate_test").transaction()
+    tx.append(pa.table({"x": [5]}))
+    tx.overwrite(pa.table({"x": [6]}), branch="test-branch")
+    catalog.load_table("default.two_branch_validate_test").append(pa.table({"x": [7]}), branch="test-branch")
+    with pytest.raises(ValidationException):
+        tx.commit_transaction()
+
+
+@pytest.mark.parametrize("first_branch", [MAIN_BRANCH, None], ids=["main", "staged"])
+def test_transaction_writes_first_snapshot_and_new_branch_to_empty_table(catalog: Catalog, first_branch: str | None) -> None:
+    """A transaction that writes the first snapshot to main, or stages it, can also write a new branch."""
+    import pyarrow as pa
+
+    catalog.create_namespace("default")
+    table = catalog.create_table("default.empty_two_branch_test", schema=_test_schema())
+
+    # On its own, a new branch cannot be written to an empty table
+    with pytest.raises(CommitFailedException, match="Table has no snapshots and can only be written to the main BRANCH"):
+        table.append(pa.table({"x": [2]}), branch="test-branch")
+
+    tx = table.transaction()
+    tx.append(pa.table({"x": [1]}), branch=first_branch)
+    tx.append(pa.table({"x": [2]}), branch="test-branch")
+    tx.commit_transaction()
+
+    refreshed = catalog.load_table("default.empty_two_branch_test")
+    assert refreshed.scan().to_arrow().column("x").to_pylist() == ([1] if first_branch == MAIN_BRANCH else [])
+    assert refreshed.scan().use_ref("test-branch").to_arrow().column("x").to_pylist() == [2]
+    assert len(refreshed.snapshots()) == 2
+
+
+def test_transaction_retries_staged_snapshot_against_concurrent_commits_to_main(catalog: Catalog) -> None:
+    """A staged snapshot is produced on top of main, so on retry it is checked against the commits to main."""
+    import pyarrow as pa
+
+    catalog.create_namespace("default")
+    table = catalog.create_table("default.staged_retry_test", schema=_test_schema())
+    table.append(pa.table({"x": [1]}))
+
+    tx = catalog.load_table("default.staged_retry_test").transaction()
+    tx.append(pa.table({"x": [2]}))
+    tx.append(pa.table({"x": [3]}), branch=None)
+    catalog.load_table("default.staged_retry_test").append(pa.table({"x": [4]}))
+    tx.commit_transaction()
+
+    refreshed = catalog.load_table("default.staged_retry_test")
+    assert sorted(refreshed.scan().to_arrow().column("x").to_pylist()) == [1, 2, 4]
+    assert len(refreshed.snapshots()) == 4
+
+
 def test_negative_num_retries_still_commits(catalog: Catalog) -> None:
     """A negative commit.retry.num-retries is clamped to 0, so one attempt still runs (matches Java).
 
@@ -1239,6 +1337,31 @@ def test_delete_that_matched_nothing_at_staging_still_validates(catalog: Catalog
     # The concurrent row is intact.
     result = catalog.load_table("default.empty_plan_delete_test").scan().to_arrow()
     assert result["x"].to_pylist() == [50]
+
+
+def test_delete_that_matched_nothing_on_second_branch_still_validates(catalog: Catalog) -> None:
+    """Empty-plan deletes on two branches are each validated against the commits to their own branch."""
+    import pyarrow as pa
+
+    catalog.create_namespace("default")
+    table = catalog.create_table("default.empty_plan_branch_delete_test", schema=_test_schema())
+    table.append(pa.table({"x": [1]}))
+    assert table.metadata.current_snapshot_id is not None
+    table.manage_snapshots().create_branch(snapshot_id=table.metadata.current_snapshot_id, branch_name="test-branch").commit()
+
+    tx = catalog.load_table("default.empty_plan_branch_delete_test").transaction()
+    with pytest.warns(UserWarning):  # the deletes match nothing at staging time
+        tx.delete("x > 45")
+        tx.delete("x > 45", branch="test-branch")
+
+    # A row matching the predicate lands concurrently on the second branch
+    catalog.load_table("default.empty_plan_branch_delete_test").append(pa.table({"x": [50]}), branch="test-branch")
+
+    with pytest.raises(ValidationException):
+        tx.commit_transaction()
+
+    result = catalog.load_table("default.empty_plan_branch_delete_test").scan().use_ref("test-branch").to_arrow()
+    assert sorted(result["x"].to_pylist()) == [1, 50]
 
 
 def test_delete_that_matched_nothing_without_concurrent_commit_succeeds(catalog: Catalog) -> None:

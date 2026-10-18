@@ -810,10 +810,6 @@ class AssertRefSnapshotId(ValidatableTableRequirement):
     def validate(self, base_metadata: TableMetadata | None) -> None:
         if base_metadata is None:
             raise CommitFailedException("Requirement failed: current table metadata is missing")
-        elif len(base_metadata.snapshots) == 0 and self.ref != MAIN_BRANCH:
-            raise CommitFailedException(
-                f"Requirement failed: Table has no snapshots and can only be written to the {MAIN_BRANCH} BRANCH."
-            )
         elif snapshot_ref := base_metadata.refs.get(self.ref):
             ref_type = snapshot_ref.snapshot_ref_type
             if self.snapshot_id is None:

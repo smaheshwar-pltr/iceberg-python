@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING, Generic
 
 from pyiceberg.avro.codecs import AvroCompressionCodec
 from pyiceberg.exceptions import (
+    CommitFailedException,
     NoSuchSnapshotRefError,
     NotAncestorError,
     SnapshotRefTypeError,
@@ -321,6 +322,12 @@ class _SnapshotProducer(UpdateTableMetadata[U], Generic[U]):
         )
 
     def _commit(self) -> UpdatesAndRequirements:
+        # Other branches can only be written once the table has a snapshot, which may be staged earlier in this transaction
+        if self._target_branch not in (None, MAIN_BRANCH) and not self._transaction.table_metadata.snapshots:
+            raise CommitFailedException(
+                f"Requirement failed: Table has no snapshots and can only be written to the {MAIN_BRANCH} BRANCH."
+            )
+
         new_manifests = self._manifests()
         next_sequence_number = self._transaction.table_metadata.next_sequence_number()
 

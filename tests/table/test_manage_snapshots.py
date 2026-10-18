@@ -29,7 +29,7 @@ from pyiceberg.io.pyarrow import PyArrowFileIO
 from pyiceberg.table import CommitTableResponse, Table
 from pyiceberg.table.metadata import TableMetadataUtil
 from pyiceberg.table.refs import SnapshotRef, SnapshotRefType
-from pyiceberg.table.update import SetSnapshotRefUpdate, TableRequirement, TableUpdate
+from pyiceberg.table.update import AssertRefSnapshotId, SetSnapshotRefUpdate, TableRequirement, TableUpdate
 
 # The two snapshots in the table_v2 fixture: CHILD's parent is PARENT.
 PARENT_SNAPSHOT_ID = 3051729675574597004
@@ -223,6 +223,10 @@ def test_set_current_snapshot_chained_with_create_tag(table_v2: Table) -> None:
     # The main branch should point to the same snapshot as the tag
     main_update = next(u for u in set_ref_updates if u.ref_name == "main")
     assert main_update.snapshot_id == snapshot_one
+
+    # Both refs should be asserted, so that a concurrent commit to either is not overwritten
+    requirements = _get_requirements(table_v2.catalog)
+    assert {r.ref for r in requirements if isinstance(r, AssertRefSnapshotId)} == {"new-tag", "main"}
 
 
 class TestFastForwardBranchSuccess:

@@ -292,11 +292,17 @@ class Transaction:
         self._updates += updates
 
         # For the requirements, it does not make sense to add a requirement more than once
-        # For example, you cannot assert that the current schema has two different IDs
-        existing_requirements = {type(requirement) for requirement in self._requirements}
+        # For example, you cannot assert that the current schema has two different IDs.
+        # Each ref is asserted separately, keeping its first requirement, since later ones
+        # expect snapshots staged by this transaction.
+        def _requirement_key(requirement: TableRequirement) -> tuple[type, str | None]:
+            return type(requirement), requirement.ref if isinstance(requirement, AssertRefSnapshotId) else None
+
+        existing_requirements = {_requirement_key(requirement) for requirement in self._requirements}
         for new_requirement in requirements:
-            if type(new_requirement) not in existing_requirements:
+            if (key := _requirement_key(new_requirement)) not in existing_requirements:
                 self._requirements = self._requirements + (new_requirement,)
+                existing_requirements.add(key)
 
         return self
 
@@ -1178,17 +1184,10 @@ class Transaction:
         elif self._snapshot_producers:
             # An empty staged output (e.g. a delete whose plan matched nothing) skips the
             # commit loop above, so run concurrency validation explicitly before reporting success.
-            from pyiceberg.table.update.snapshot import CommitWindow
-
             try:
                 self._table.refresh()
-                commit_window = CommitWindow.resolve(
-                    self._table.metadata,
-                    self._snapshot_producers[0]._starting_snapshot_id,
-                    self._snapshot_producers[0]._target_branch,
-                )
+                self._resolve_commit_windows()
                 for producer in self._snapshot_producers:
-                    producer._commit_window = commit_window
                     producer._validate_concurrency()
             except Exception:
                 for producer in self._snapshot_producers:
@@ -1208,20 +1207,28 @@ class Transaction:
         for producer in self._snapshot_producers:
             producer._cleanup_uncommitted()
 
+    def _resolve_commit_windows(self) -> None:
+        """Point each producer at the commits made to its branch since this transaction started writing to it."""
+        from pyiceberg.table.update.snapshot import CommitWindow
+
+        commit_windows: dict[str, CommitWindow] = {}
+        for producer in self._snapshot_producers:
+            # Staged snapshots are produced on top of main
+            branch = producer._target_branch if producer._target_branch is not None else MAIN_BRANCH
+            if branch not in commit_windows:
+                # Later producers of a branch start from snapshots staged in this transaction, so use the first
+                commit_windows[branch] = CommitWindow.resolve(self._table.metadata, producer._starting_snapshot_id, branch)
+            producer._commit_window = commit_windows[branch]
+
     def _rebuild_snapshot_updates(self) -> None:
         """Rebuild snapshot updates for retry by re-executing registered producers."""
         from pyiceberg.table.update import AddSnapshotUpdate, AssertRefSnapshotId, SetSnapshotRefUpdate
-        from pyiceberg.table.update.snapshot import CommitWindow
 
         self._updates = tuple(u for u in self._updates if not isinstance(u, (AddSnapshotUpdate, SetSnapshotRefUpdate)))
         self._requirements = tuple(r for r in self._requirements if not isinstance(r, AssertRefSnapshotId))
 
-        starting_id = self._snapshot_producers[0]._starting_snapshot_id if self._snapshot_producers else None
-        target_branch = self._snapshot_producers[0]._target_branch if self._snapshot_producers else None
-        commit_window = CommitWindow.resolve(self._table.metadata, starting_id, target_branch)
-
+        self._resolve_commit_windows()
         for producer in self._snapshot_producers:
-            producer._commit_window = commit_window
             producer._refresh_for_retry()
             producer._validate_concurrency()
             updates, requirements = producer._commit()
