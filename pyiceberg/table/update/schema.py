@@ -42,6 +42,7 @@ from pyiceberg.table.name_mapping import (
 from pyiceberg.table.update import (
     AddSchemaUpdate,
     AssertCurrentSchemaId,
+    AssertLastAssignedFieldId,
     SetCurrentSchemaUpdate,
     SetPropertiesUpdate,
     TableRequirement,
@@ -100,13 +101,15 @@ class UpdateSchema(UpdateTableMetadata["UpdateSchema"]):
     ) -> None:
         super().__init__(transaction)
 
+        table_metadata = self._transaction.table_metadata
         if isinstance(schema, Schema):
             self._schema = schema
             self._last_column_id = itertools.count(1 + schema.highest_field_id)
         else:
-            self._schema = self._transaction.table_metadata.schema()
-            self._last_column_id = itertools.count(1 + self._transaction.table_metadata.last_column_id)
+            self._schema = table_metadata.schema()
+            self._last_column_id = itertools.count(1 + table_metadata.last_column_id)
 
+        self._base_last_column_id = table_metadata.last_column_id
         self._name_mapping = name_mapping
         self._identifier_field_names = self._schema.identifier_field_names()
 
@@ -635,6 +638,8 @@ class UpdateSchema(UpdateTableMetadata["UpdateSchema"]):
         if existing_schema_id != self._schema.schema_id:
             requirements += (AssertCurrentSchemaId(current_schema_id=self._schema.schema_id),)
             if existing_schema_id is None:
+                # The field IDs of added columns are only unique if the last column ID is unchanged
+                requirements += (AssertLastAssignedFieldId(last_assigned_field_id=self._base_last_column_id),)
                 updates += (
                     AddSchemaUpdate(schema=new_schema),
                     SetCurrentSchemaUpdate(schema_id=-1),

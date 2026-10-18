@@ -591,6 +591,7 @@ def test_catalog_commit_table_applies_schema_updates(
         NestedField(2, "y", LongType(), doc="comment"),
         NestedField(3, "z", LongType()),
         NestedField(4, "add", LongType()),
+        schema_id=1,
     )
 
     response = table.catalog.commit_table(
@@ -620,6 +621,50 @@ def test_concurrent_commit_table(catalog: Catalog, table_schema_nested: Schema, 
         # This one should fail since it already has been updated
         with table_b.update_schema() as update:
             update.add_column(path="c", field_type=IntegerType())
+
+
+def test_concurrent_commit_table_field_id_already_taken(
+    catalog: Catalog, table_schema_simple: Schema, test_table_identifier: Identifier
+) -> None:
+    namespace = Catalog.namespace_from(test_table_identifier)
+    catalog.create_namespace(namespace)
+    table_a = catalog.create_table(test_table_identifier, table_schema_simple)
+    table_b = catalog.load_table(test_table_identifier)
+
+    # Adding and then deleting a column sets the current schema back to schema 0
+    table_a.update_schema().add_column(path="a", field_type=IntegerType()).commit()
+    table_a.update_schema().delete_column("a").commit()
+
+    # Otherwise the new column would reuse the field ID of the deleted column
+    with pytest.raises(CommitFailedException, match="last assigned field id has changed: expected 3, found 4"):
+        table_b.update_schema().add_column(path="b", field_type=IntegerType()).commit()
+
+    table = catalog.load_table(test_table_identifier)
+    assert [schema.schema_id for schema in table.metadata.schemas] == [0, 1]
+    assert table.metadata.current_schema_id == 0
+
+
+def test_concurrent_commit_table_schema_id_already_taken(
+    catalog: Catalog, table_schema_simple: Schema, test_table_identifier: Identifier
+) -> None:
+    namespace = Catalog.namespace_from(test_table_identifier)
+    catalog.create_namespace(namespace)
+    table_a = catalog.create_table(test_table_identifier, table_schema_simple)
+    table_b = catalog.load_table(test_table_identifier)
+
+    # Renaming a column and renaming it back sets the current schema back to schema 0
+    table_a.update_schema().rename_column("foo", "qux").commit()
+    table_a.update_schema().rename_column("qux", "foo").commit()
+
+    with pytest.raises(CommitFailedException, match="Schema with id 1 already exists"):
+        table_b.update_schema().add_column(path="b", field_type=IntegerType()).commit()
+
+    # An identical schema is not added twice
+    table_b.update_schema().rename_column("foo", "qux").commit()
+
+    table = catalog.load_table(test_table_identifier)
+    assert [schema.schema_id for schema in table.metadata.schemas] == [0, 1]
+    assert table.metadata.current_schema_id == 1
 
 
 def test_delete_metadata_multiple(catalog: Catalog, table_schema_nested: Schema, random_table_identifier: Identifier) -> None:
