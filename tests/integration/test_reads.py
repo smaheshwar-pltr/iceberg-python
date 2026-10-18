@@ -299,7 +299,7 @@ def test_hive_critical_properties_always_from_iceberg(catalog: Catalog) -> None:
 def test_hive_native_properties_cannot_be_deleted_via_iceberg(catalog: Catalog) -> None:
     """Test that HMS-native properties (set outside Iceberg) cannot be deleted via Iceberg.
 
-    HMS-native properties are not visible to Iceberg, so remove_properties fails with KeyError.
+    HMS-native properties are not visible to Iceberg, so remove_properties leaves them in place.
     However, if you first SET an HMS property via Iceberg (making it tracked in Iceberg metadata),
     it can then be deleted via Iceberg.
     """
@@ -323,16 +323,15 @@ def test_hive_native_properties_cannot_be_deleted_via_iceberg(catalog: Catalog) 
     # Verify the HMS-native property is NOT visible in Iceberg
     assert "hms_native_prop" not in table.properties
 
-    # Attempt to remove the HMS-native property via Iceberg - this should fail
+    # Attempt to remove the HMS-native property via Iceberg - this is a no-op
     # because the property is not tracked in Iceberg metadata (not visible to Iceberg)
-    with pytest.raises(KeyError):
-        table.transaction().remove_properties("hms_native_prop").commit_transaction()
+    table.transaction().remove_properties("hms_native_prop").commit_transaction()
 
     # HMS-native property should still exist (cannot be deleted via Iceberg)
     with hive_client as open_client:
         hive_table = _get_hive_table(open_client)
         assert hive_table.parameters.get("hms_native_prop") == "native_value", (
-            "HMS-native property should still exist since Iceberg removal failed!"
+            "HMS-native property should still exist since Iceberg removal is a no-op!"
         )
 
     # Now SET the same property via Iceberg (this makes it tracked in Iceberg metadata)

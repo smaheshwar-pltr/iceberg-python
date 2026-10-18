@@ -684,6 +684,20 @@ def test_table_properties_raise_for_none_value(
     assert "None type is not a supported value in properties: property_name" in str(exc_info.value)
 
 
+def test_remove_properties_already_removed_by_concurrent_commit(
+    catalog: Catalog, table_schema_simple: Schema, test_table_identifier: Identifier
+) -> None:
+    namespace = Catalog.namespace_from(test_table_identifier)
+    catalog.create_namespace(namespace)
+    table = catalog.create_table(test_table_identifier, table_schema_simple, properties={"a": "1", "b": "2"})
+
+    transaction = table.transaction().remove_properties("a", "b")
+    catalog.load_table(test_table_identifier).transaction().remove_properties("a").commit_transaction()
+    transaction.commit_transaction()
+
+    assert catalog.load_table(test_table_identifier).properties == {}
+
+
 # Append table
 
 
