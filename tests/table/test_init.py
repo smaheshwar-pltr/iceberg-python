@@ -26,7 +26,7 @@ from pytest_lazy_fixtures import lf
 
 from pyiceberg.catalog import Catalog
 from pyiceberg.catalog.noop import NoopCatalog
-from pyiceberg.exceptions import CommitFailedException
+from pyiceberg.exceptions import CommitFailedException, NoSuchSnapshotRefError, NotAncestorError, SnapshotRefTypeError
 from pyiceberg.expressions import (
     AlwaysTrue,
     And,
@@ -39,6 +39,7 @@ from pyiceberg.partitioning import PartitionField, PartitionSpec
 from pyiceberg.schema import Schema
 from pyiceberg.table import (
     CommitTableRequest,
+    IncrementalAppendScan,
     StagedTable,
     StaticTable,
     Table,
@@ -389,6 +390,7 @@ def test_incremental_append_scan_default(table_v2: Table) -> None:
     assert scan.from_snapshot_id is None
     assert scan.from_snapshot_inclusive is False
     assert scan.to_snapshot_id is None
+    assert scan.branch is None
 
 
 def test_incremental_append_scan_no_current_snapshot(example_table_metadata_no_snapshot_v1: dict[str, Any]) -> None:
@@ -553,6 +555,10 @@ def test_incremental_append_scan_admits_expired_from_snapshot(example_table_meta
     # because that would require real manifest files.
     assert scan._validate_and_resolve_snapshots() == (expired_snapshot_id, remaining_snapshot_id)
 
+    # The same holds when the end is the head of a branch.
+    branch_scan = table.incremental_append_scan(from_snapshot_id_exclusive=expired_snapshot_id).use_branch(MAIN_BRANCH)
+    assert branch_scan._validate_and_resolve_snapshots() == (expired_snapshot_id, remaining_snapshot_id)
+
 
 def test_incremental_append_scan_update_preserves_type(table_v2: Table) -> None:
     # `update()` lives on BaseScan and uses `type(self)(...)` to construct the copy;
@@ -564,6 +570,7 @@ def test_incremental_append_scan_update_preserves_type(table_v2: Table) -> None:
     assert type(base_scan.from_snapshot_id_exclusive(456)) is base_type
     assert type(base_scan.from_snapshot_id_inclusive(456)) is base_type
     assert type(base_scan.to_snapshot_id_inclusive(789)) is base_type
+    assert type(base_scan.use_branch("main")) is base_type
     assert type(base_scan.filter(EqualTo("x", 1))) is base_type
     assert type(base_scan.select("x")) is base_type
     assert type(base_scan.with_case_sensitive(False)) is base_type
@@ -572,6 +579,7 @@ def test_incremental_append_scan_update_preserves_type(table_v2: Table) -> None:
     assert base_scan.from_snapshot_id_inclusive(456).from_snapshot_inclusive is True
     assert base_scan.to_snapshot_id_inclusive(789).to_snapshot_id == 789
     assert base_scan.update(to_snapshot_id=789).update(to_snapshot_id=None).to_snapshot_id is None
+    assert base_scan.use_branch("main").filter(EqualTo("x", 1)).branch == "main"
 
 
 def test_incremental_append_scan_staged_table_raises(table_v2: Table) -> None:
@@ -585,6 +593,71 @@ def test_incremental_append_scan_staged_table_raises(table_v2: Table) -> None:
     )
     with pytest.raises(ValueError, match="Cannot scan a staged table"):
         staged_table.incremental_append_scan()
+
+
+def test_incremental_append_scan_use_branch(catalog: Catalog) -> None:
+    import pyarrow as pa
+
+    catalog.create_namespace("default")
+    table = catalog.create_table("default.incremental_branch", schema=Schema(NestedField(1, "number", LongType())))
+
+    def append(numbers: list[int], branch: str = MAIN_BRANCH) -> int:
+        table.append(pa.table({"number": pa.array(numbers, pa.int64())}), branch=branch)
+        return table.refs()[branch].snapshot_id
+
+    def read_numbers(scan: IncrementalAppendScan) -> list[int]:
+        return sorted(scan.to_arrow()["number"].to_pylist())
+
+    # A(1) -- B(2, 3) -- C(4, 5)  <- main
+    #   \-- D(6) -- E(7)          <- b1
+    snapshot_a = append([1])
+    table.manage_snapshots().create_branch(snapshot_id=snapshot_a, branch_name="b1").commit()
+    snapshot_b = append([2, 3])
+    append([4, 5])
+    snapshot_d = append([6], branch="b1")
+    snapshot_e = append([7], branch="b1")
+
+    assert read_numbers(table.incremental_append_scan()) == [1, 2, 3, 4, 5]
+
+    # The end defaults to the branch head.
+    assert read_numbers(table.incremental_append_scan().use_branch("b1")) == [1, 6, 7]
+    assert read_numbers(table.incremental_append_scan(from_snapshot_id_exclusive=snapshot_a).use_branch("b1")) == [6, 7]
+
+    # An explicit end must be on the branch.
+    assert read_numbers(table.incremental_append_scan(to_snapshot_id_inclusive=snapshot_d).use_branch("b1")) == [1, 6]
+    scan = table.incremental_append_scan(from_snapshot_id_exclusive=snapshot_a, to_snapshot_id_inclusive=snapshot_d)
+    assert read_numbers(scan.use_branch("b1")) == [6]
+    with pytest.raises(NotAncestorError, match=f"End snapshot {snapshot_b} is not an ancestor of branch b1 head {snapshot_e}"):
+        table.incremental_append_scan(to_snapshot_id_inclusive=snapshot_b).use_branch("b1").to_arrow()
+
+    # The start is validated against the branch head.
+    expected_message = f"Starting snapshot .inclusive. {snapshot_b} is not an ancestor of end snapshot {snapshot_e}"
+    with pytest.raises(ValueError, match=expected_message):
+        table.incremental_append_scan().from_snapshot_id_inclusive(snapshot_b).use_branch("b1").to_arrow()
+
+    # Without main (as when another engine creates a branch on an empty table), the branch is still read.
+    table.manage_snapshots().remove_branch(MAIN_BRANCH).commit()
+    assert table.current_snapshot() is None
+    assert read_numbers(table.incremental_append_scan()) == []
+    assert read_numbers(table.incremental_append_scan().use_branch("b1")) == [1, 6, 7]
+    with pytest.raises(NoSuchSnapshotRefError, match="Ref does not exist: main"):
+        table.incremental_append_scan().use_branch(MAIN_BRANCH).to_arrow()
+
+
+@pytest.mark.parametrize(
+    "branch, expected_error, expected_message",
+    [
+        ("missing", NoSuchSnapshotRefError, "Ref does not exist: missing"),
+        ("test", SnapshotRefTypeError, "Ref test is a tag, not a branch"),
+    ],
+)
+def test_incremental_append_scan_use_branch_rejects_invalid_ref(
+    table_v2: Table, branch: str, expected_error: type[Exception], expected_message: str
+) -> None:
+    # The ref is validated before the end snapshot, so the missing end snapshot isn't reported.
+    scan = table_v2.incremental_append_scan(to_snapshot_id_inclusive=42).use_branch(branch)
+    with pytest.raises(expected_error, match=expected_message):
+        list(scan.plan_files())
 
 
 def test_static_table_same_as_table(table_v2: Table, metadata_location: str) -> None:

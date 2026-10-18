@@ -33,7 +33,13 @@ from typing import TYPE_CHECKING, Any, TypeVar
 
 from pydantic import Field
 
-from pyiceberg.exceptions import CommitFailedException, ValidationException
+from pyiceberg.exceptions import (
+    CommitFailedException,
+    NoSuchSnapshotRefError,
+    NotAncestorError,
+    SnapshotRefTypeError,
+    ValidationException,
+)
 from pyiceberg.expressions import AlwaysFalse, AlwaysTrue, And, BooleanExpression, EqualTo, IsNull, Or, Reference
 from pyiceberg.expressions.visitors import (
     ResidualEvaluator,
@@ -53,7 +59,7 @@ from pyiceberg.table.locations import LocationProvider, load_location_provider
 from pyiceberg.table.maintenance import MaintenanceTable
 from pyiceberg.table.metadata import INITIAL_SEQUENCE_NUMBER, TableMetadata
 from pyiceberg.table.name_mapping import NameMapping
-from pyiceberg.table.refs import MAIN_BRANCH, SnapshotRef
+from pyiceberg.table.refs import MAIN_BRANCH, SnapshotRef, SnapshotRefType
 from pyiceberg.table.snapshots import (
     Operation,
     Snapshot,
@@ -1465,7 +1471,7 @@ class Table:
                 starts from the oldest ancestor of the end snapshot (inclusive).
             to_snapshot_id_inclusive:
                 Optional ID of the snapshot to end the incremental scan at, inclusively. If not set, it defaults to
-                the table's current snapshot.
+                the table's current snapshot (or the branch head after ``use_branch()``).
             row_filter:
                 A string or BooleanExpression that describes the
                 desired rows.
@@ -2563,7 +2569,11 @@ class IncrementalAppendScan(BaseScan):
             exclusive.
         to_snapshot_id:
             Optional ID of the snapshot to end the incremental scan at, inclusively.
-            Omitting it will default to the table's current snapshot.
+            Omitting it will default to the head of the branch if set, otherwise
+            the table's current snapshot.
+        branch:
+            Optional name of the branch to scan. The end snapshot defaults to its
+            head, and an explicit end snapshot must be an ancestor of its head.
         row_filter:
             A string or BooleanExpression that describes the
             desired rows
@@ -2584,6 +2594,7 @@ class IncrementalAppendScan(BaseScan):
     from_snapshot_id: int | None
     from_snapshot_inclusive: bool
     to_snapshot_id: int | None
+    branch: str | None
 
     def __init__(
         self,
@@ -2597,6 +2608,7 @@ class IncrementalAppendScan(BaseScan):
         to_snapshot_id: int | None = None,
         options: Properties = EMPTY_DICT,
         limit: int | None = None,
+        branch: str | None = None,
     ):
         super().__init__(
             table_metadata=table_metadata,
@@ -2610,6 +2622,7 @@ class IncrementalAppendScan(BaseScan):
         self.from_snapshot_id = from_snapshot_id
         self.from_snapshot_inclusive = from_snapshot_inclusive
         self.to_snapshot_id = to_snapshot_id
+        self.branch = branch
 
     def from_snapshot_id_exclusive(self: IAS, from_snapshot_id: int) -> IAS:
         """Return a copy of this scan that starts (exclusively) from the given snapshot ID."""
@@ -2623,6 +2636,10 @@ class IncrementalAppendScan(BaseScan):
         """Return a copy of this scan that ends (inclusively) at the given snapshot ID."""
         return self.update(to_snapshot_id=to_snapshot_id)
 
+    def use_branch(self: IAS, branch: str) -> IAS:
+        """Return a copy of this scan on the given branch: the end defaults to its head, and an explicit end must be on it."""
+        return self.update(branch=branch)
+
     def projection(self) -> Schema:
         current_schema = self.table_metadata.schema()
         if "*" in self.selected_fields:
@@ -2631,8 +2648,13 @@ class IncrementalAppendScan(BaseScan):
 
     def plan_files(self) -> Iterable[FileScanTask]:
         """Plans the relevant files added between the specified snapshots."""
-        # With neither bound set, an empty table (no current snapshot) has nothing to scan.
-        if self.from_snapshot_id is None and self.to_snapshot_id is None and self.table_metadata.current_snapshot() is None:
+        # With neither a bound nor a branch set, an empty table (no current snapshot) has nothing to scan.
+        if (
+            self.from_snapshot_id is None
+            and self.to_snapshot_id is None
+            and self.branch is None
+            and self.table_metadata.current_snapshot() is None
+        ):
             return []
 
         from_snapshot_id_exclusive, to_snapshot_id = self._validate_and_resolve_snapshots()
@@ -2700,11 +2722,26 @@ class IncrementalAppendScan(BaseScan):
 
         A ``None`` "from" means the scan starts from the oldest ancestor of the end snapshot.
         """
-        # Resolve the inclusive end snapshot, defaulting to the table's current snapshot.
+        # A branch must exist, and its head bounds the end snapshot.
+        branch_head_id: int | None = None
+        if self.branch is not None:
+            if (branch_ref := self.table_metadata.refs.get(self.branch)) is None:
+                raise NoSuchSnapshotRefError(f"Ref does not exist: {self.branch}")
+            if branch_ref.snapshot_ref_type != SnapshotRefType.BRANCH:
+                raise SnapshotRefTypeError(f"Ref {self.branch} is a tag, not a branch")
+            branch_head_id = branch_ref.snapshot_id
+
+        # Resolve the inclusive end snapshot, defaulting to the branch head or the table's current snapshot.
         if self.to_snapshot_id is not None:
             if self.table_metadata.snapshot_by_id(self.to_snapshot_id) is None:
                 raise ValueError(f"End snapshot not found in table metadata: {self.to_snapshot_id}")
+            if branch_head_id is not None and not is_ancestor_of(branch_head_id, self.to_snapshot_id, self.table_metadata):
+                raise NotAncestorError(
+                    f"End snapshot {self.to_snapshot_id} is not an ancestor of branch {self.branch} head {branch_head_id}"
+                )
             to_snapshot_id = self.to_snapshot_id
+        elif branch_head_id is not None:
+            to_snapshot_id = branch_head_id
         else:
             current_snapshot = self.table_metadata.current_snapshot()
             if current_snapshot is None:
