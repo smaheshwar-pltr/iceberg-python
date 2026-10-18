@@ -2281,6 +2281,27 @@ DataFrame()
 +---+---+
 ```
 
+## Incremental append scan
+
+To read the data appended between two snapshots, use `incremental_append_scan()`:
+
+- `from_snapshot_id_exclusive`: the snapshot to start after. It must be an ancestor of the end snapshot. Omitting it reads from the oldest ancestor of the end snapshot.
+- `to_snapshot_id_inclusive`: the snapshot to end at. Omitting it defaults to the current snapshot.
+
+```python
+# Get the data appended after snapshot 10963874102873 up to and including snapshot 63874143573109
+table.incremental_append_scan(
+    from_snapshot_id_exclusive=10963874102873,
+    to_snapshot_id_inclusive=63874143573109,
+).to_arrow()
+```
+
+The scan accepts the same `row_filter`, `selected_fields`, `case_sensitive` and `limit` arguments as `scan()` and has the same `to_*` methods. To include the start snapshot, call `.from_snapshot_id_inclusive(snapshot_id)` on the scan instead.
+
+!!! info
+    Only data from `append` snapshots is read. `overwrite`, `delete` and `replace` snapshots are skipped, so rows deleted after they were appended are still returned: this is not a changelog scan. PyIceberg's `overwrite()`, `dynamic_partition_overwrite()` and `upsert()` write their new rows in an `append` snapshot, so those rows are included.
+    Rows are read with the table's current schema, and planning always happens client-side.
+
 ## Type mapping
 
 ### PyArrow

@@ -455,7 +455,8 @@ def ancestors_between_ids(
 ) -> Iterable[Snapshot]:
     """Get the ancestors of and including the given "to" snapshot, up to but not including the "from" snapshot.
 
-    If ``from_snapshot_id_exclusive`` is None, all ancestors of the "to" snapshot are returned.
+    If ``from_snapshot_id_exclusive`` is None, or is neither the "to" snapshot nor one of its ancestors, all ancestors
+    of the "to" snapshot are returned, so callers should validate it first (see ``is_parent_ancestor_of``).
 
     Raises:
         ValueError: if ``to_snapshot_id_inclusive`` is not present in the table metadata.

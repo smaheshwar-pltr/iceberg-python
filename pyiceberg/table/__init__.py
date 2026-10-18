@@ -1458,6 +1458,7 @@ class Table:
 
         The incremental append scan returns the rows added by append snapshots in a snapshot
         range that match the provided row_filter, projected onto the table's current schema.
+        Non-append snapshots in the range are skipped, so this is not a changelog scan.
 
         Args:
             from_snapshot_id_exclusive:
@@ -2554,6 +2555,8 @@ IAS = TypeVar("IAS", bound="IncrementalAppendScan", covariant=True)
 class IncrementalAppendScan(BaseScan):
     """An incremental scan of a table's data that accumulates appended data between two snapshots.
 
+    Non-append snapshots in the range are skipped, so this is not a changelog scan.
+
     Args:
         from_snapshot_id:
             ID of the snapshot to start the incremental scan from. If None, the scan starts from
@@ -2673,7 +2676,7 @@ class IncrementalAppendScan(BaseScan):
         )
 
     def to_arrow(self) -> pa.Table:
-        """Read an Arrow table eagerly from this IncrementalAppendScan.
+        """Read the rows added by append snapshots in this scan's range into an Arrow table.
 
         All rows will be loaded into memory at once.
 
@@ -2683,7 +2686,7 @@ class IncrementalAppendScan(BaseScan):
         return _to_arrow_via_file_scan_tasks(self, self.projection(), self.plan_files())
 
     def to_arrow_batch_reader(self) -> pa.RecordBatchReader:
-        """Return an Arrow RecordBatchReader from this IncrementalAppendScan.
+        """Return an Arrow RecordBatchReader over the rows added by append snapshots in this scan's range.
 
         For large results, using a RecordBatchReader requires less memory than
         loading an Arrow Table for the same IncrementalAppendScan, because a
@@ -2698,7 +2701,8 @@ class IncrementalAppendScan(BaseScan):
     def _validate_and_resolve_snapshots(self) -> tuple[int | None, int]:
         """Resolve the configured range to ``(from_snapshot_id_exclusive, to_snapshot_id_inclusive)``.
 
-        A ``None`` "from" means the scan starts from the oldest ancestor of the end snapshot.
+        A ``None`` "from" means the scan starts from the oldest ancestor of the end snapshot. An inclusive
+        "from" is resolved to its parent, which becomes the exclusive boundary.
         """
         # Resolve the inclusive end snapshot, defaulting to the table's current snapshot.
         if self.to_snapshot_id is not None:
