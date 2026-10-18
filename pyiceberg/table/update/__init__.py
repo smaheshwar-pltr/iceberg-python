@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING, Annotated, Any, Generic, Literal, TypeVar, cas
 
 from pydantic import Field, field_validator, model_serializer, model_validator
 
-from pyiceberg.exceptions import CommitFailedException
+from pyiceberg.exceptions import CommitFailedException, ValidationException
 from pyiceberg.partitioning import PARTITION_FIELD_ID_START, PartitionSpec
 from pyiceberg.schema import Schema
 from pyiceberg.table.metadata import SUPPORTED_TABLE_FORMAT_VERSION, TableMetadata, TableMetadataUtil
@@ -440,9 +440,20 @@ def _(update: AddSnapshotUpdate, base_metadata: TableMetadata, context: _TableMe
         and update.snapshot.sequence_number <= base_metadata.last_sequence_number
         and update.snapshot.parent_snapshot_id is not None
     ):
-        raise ValueError(
+        # A concurrent commit took the sequence number, so the commit can be retried with a new one
+        raise CommitFailedException(
             f"Cannot add snapshot with sequence number {update.snapshot.sequence_number} "
             f"older than last sequence number {base_metadata.last_sequence_number}"
+        )
+    elif (
+        base_metadata.format_version == 2
+        and update.snapshot.sequence_number is not None
+        and update.snapshot.sequence_number < base_metadata.last_sequence_number
+    ):
+        # A snapshot without a parent skips the check above, but it can't lower the last sequence number
+        raise ValidationException(
+            f"Cannot add snapshot with sequence number {update.snapshot.sequence_number} "
+            f"lower than last sequence number {base_metadata.last_sequence_number}"
         )
     elif base_metadata.format_version >= 3 and update.snapshot.first_row_id is None:
         raise ValueError("Cannot add snapshot without first row id")
