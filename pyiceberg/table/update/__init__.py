@@ -284,6 +284,9 @@ class _TableMetadataUpdateContext:
     def is_added_schema(self, schema_id: int) -> bool:
         return any(update.schema_.schema_id == schema_id for update in self._updates if isinstance(update, AddSchemaUpdate))
 
+    def last_added_schema_id(self) -> int | None:
+        return next((update.schema_.schema_id for update in reversed(self._updates) if isinstance(update, AddSchemaUpdate)), None)
+
     def is_added_partition_spec(self, spec_id: int) -> bool:
         return any(update.spec.spec_id == spec_id for update in self._updates if isinstance(update, AddPartitionSpecUpdate))
 
@@ -375,9 +378,14 @@ def _(update: RemovePropertiesUpdate, base_metadata: TableMetadata, context: _Ta
 
 @_apply_table_update.register(AddSchemaUpdate)
 def _(update: AddSchemaUpdate, base_metadata: TableMetadata, context: _TableMetadataUpdateContext) -> TableMetadata:
+    existing_schema = base_metadata.schema_by_id(update.schema_.schema_id)
+    if existing_schema is not None and existing_schema != update.schema_:
+        raise CommitFailedException(f"Schema with id {update.schema_.schema_id} already exists")
+
     metadata_updates: dict[str, Any] = {
         "last_column_id": max(base_metadata.last_column_id, update.schema_.highest_field_id),
-        "schemas": base_metadata.schemas + [update.schema_],
+        # An identical schema with the same ID is not added twice
+        "schemas": base_metadata.schemas if existing_schema is not None else base_metadata.schemas + [update.schema_],
     }
 
     context.add_update(update)
@@ -388,10 +396,11 @@ def _(update: AddSchemaUpdate, base_metadata: TableMetadata, context: _TableMeta
 def _(update: SetCurrentSchemaUpdate, base_metadata: TableMetadata, context: _TableMetadataUpdateContext) -> TableMetadata:
     new_schema_id = update.schema_id
     if new_schema_id == -1:
-        # The last added schema should be in base_metadata.schemas at this point
-        new_schema_id = max(schema.schema_id for schema in base_metadata.schemas)
-        if not context.is_added_schema(new_schema_id):
+        # Not necessarily the highest ID, since an added schema reuses the ID of an identical schema
+        last_added_schema_id = context.last_added_schema_id()
+        if last_added_schema_id is None:
             raise ValueError("Cannot set current schema to last added schema when no schema has been added")
+        new_schema_id = last_added_schema_id
 
     if new_schema_id == base_metadata.current_schema_id:
         return base_metadata
