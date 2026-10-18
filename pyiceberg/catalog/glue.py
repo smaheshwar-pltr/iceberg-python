@@ -42,6 +42,7 @@ from pyiceberg.catalog import (
 )
 from pyiceberg.exceptions import (
     CommitFailedException,
+    CommitStateUnknownException,
     NamespaceAlreadyExistsError,
     NamespaceNotEmptyError,
     NoSuchIcebergTableError,
@@ -412,10 +413,26 @@ class GlueCatalog(MetastoreCatalog):
         except self.glue.exceptions.EntityNotFoundException as e:
             raise NoSuchTableError(f"Table does not exist: {database_name}.{table_name} (Glue table version {version_id})") from e
         except self.glue.exceptions.ConcurrentModificationException as e:
+            # The client retries failed requests, so the conflict may come from an earlier attempt of this update that landed
+            retried = e.response.get("ResponseMetadata", {}).get("RetryAttempts", 0) > 0
+            if retried and self._is_committed(database_name, table_name, table_input["Parameters"][METADATA_LOCATION]):
+                return
             raise CommitFailedException(
                 f"Cannot commit {database_name}.{table_name} because Glue detected concurrent update "
                 f"to table version {version_id}"
             ) from e
+
+    def _is_committed(self, database_name: str, table_name: str, metadata_location: str) -> bool:
+        """Check whether the metadata location is the table's current one or in its metadata log."""
+        try:
+            table = self.load_table((database_name, table_name))
+        except Exception as e:
+            raise CommitStateUnknownException(
+                f"Cannot determine whether the commit to {database_name}.{table_name} succeeded"
+            ) from e
+        return table.metadata_location == metadata_location or any(
+            log.metadata_file == metadata_location for log in table.metadata.metadata_log
+        )
 
     def _get_glue_table(self, database_name: str, table_name: str) -> "TableTypeDef":
         try:
@@ -647,6 +664,7 @@ class GlueCatalog(MetastoreCatalog):
         Raises:
             NoSuchTableError: If a table with the given identifier does not exist.
             CommitFailedException: Requirement not met, or a conflict with a concurrent commit.
+            CommitStateUnknownException: A retried update failed and its commit status could not be checked.
         """
         table_identifier = table.name()
         database_name, table_name = self.identifier_to_database_and_table(table_identifier, NoSuchTableError)
