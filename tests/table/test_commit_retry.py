@@ -957,6 +957,56 @@ def test_commit_retry_delete_on_non_main_branch(catalog: Catalog) -> None:
     assert sorted(result.column("x").to_pylist()) == [2, 3, 4, 5, 6, 7, 8, 9]
 
 
+def test_commit_retry_when_concurrent_commit_takes_the_sequence_number(catalog: Catalog) -> None:
+    """Verify that a snapshot whose sequence number a concurrent commit took is retried with a new one."""
+    catalog.create_namespace("default")
+    catalog.create_table("default.sequence_number_retry_test", schema=_test_schema())
+
+    import pyarrow as pa
+
+    df = pa.table({"x": [1, 2, 3]})
+    tbl = catalog.load_table("default.sequence_number_retry_test")
+    tbl.append(df)
+    assert tbl.metadata.current_snapshot_id is not None
+    tbl.manage_snapshots().create_branch(snapshot_id=tbl.metadata.current_snapshot_id, branch_name="test-branch").commit()
+
+    txn = catalog.load_table("default.sequence_number_retry_test").transaction()
+    txn.append(df, branch="test-branch")
+    # The append to main takes the sequence number of the branch append
+    catalog.load_table("default.sequence_number_retry_test").append(df)
+    txn.commit_transaction()
+
+    refreshed = catalog.load_table("default.sequence_number_retry_test")
+    assert [snapshot.sequence_number for snapshot in refreshed.snapshots()] == [1, 2, 3]
+    assert refreshed.metadata.last_sequence_number == 3
+
+
+def test_snapshot_without_parent_cannot_lower_the_last_sequence_number(catalog: Catalog) -> None:
+    """Verify that a snapshot without a parent whose sequence number is behind the last one is rejected."""
+    catalog.create_namespace("default")
+    catalog.create_table("default.sequence_number_lower_test", schema=_test_schema())
+
+    import pyarrow as pa
+
+    df = pa.table({"x": [1, 2, 3]})
+    catalog.load_table("default.sequence_number_lower_test").append(df)
+    txn = catalog.load_table("default.sequence_number_lower_test").transaction()
+    txn.append(df, branch="new-branch")
+    staged_snapshot = txn.table_metadata.snapshot_by_name("new-branch")
+    assert staged_snapshot is not None
+    # The appends to main take the sequence number of the branch append and the one after it
+    catalog.load_table("default.sequence_number_lower_test").append(df)
+    catalog.load_table("default.sequence_number_lower_test").append(df)
+
+    with pytest.raises(ValidationException, match="Cannot add snapshot with sequence number 2 lower than last sequence number 3"):
+        txn.commit_transaction()
+
+    table = catalog.load_table("default.sequence_number_lower_test")
+    assert table.metadata.last_sequence_number == 3
+    # The commit didn't land, so its files are deleted
+    assert not table.io.new_input(staged_snapshot.manifest_list).exists()
+
+
 def test_negative_num_retries_still_commits(catalog: Catalog) -> None:
     """A negative commit.retry.num-retries is clamped to 0, so one attempt still runs (matches Java).
 
