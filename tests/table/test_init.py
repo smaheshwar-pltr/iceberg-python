@@ -26,7 +26,7 @@ from pytest_lazy_fixtures import lf
 
 from pyiceberg.catalog import Catalog
 from pyiceberg.catalog.noop import NoopCatalog
-from pyiceberg.exceptions import CommitFailedException
+from pyiceberg.exceptions import CommitFailedException, ValidationException
 from pyiceberg.expressions import (
     AlwaysTrue,
     And,
@@ -1083,6 +1083,35 @@ def test_update_metadata_add_snapshot(table_v2: Table) -> None:
     assert new_metadata.snapshots[-1] == new_snapshot
     assert new_metadata.last_sequence_number == new_snapshot.sequence_number
     assert new_metadata.last_updated_ms == new_snapshot.timestamp_ms
+
+
+def _snapshot_without_parent(sequence_number: int) -> Snapshot:
+    return Snapshot(
+        snapshot_id=25,
+        parent_snapshot_id=None,
+        sequence_number=sequence_number,
+        timestamp_ms=1602638593590,
+        manifest_list="s3:/a/b/c.avro",
+        summary=Summary(Operation.APPEND),
+        schema_id=3,
+    )
+
+
+def test_update_metadata_add_snapshot_without_parent_with_last_sequence_number(table_v2: Table) -> None:
+    last_sequence_number = table_v2.metadata.last_sequence_number
+    new_snapshot = _snapshot_without_parent(last_sequence_number)
+
+    new_metadata = update_table_metadata(table_v2.metadata, (AddSnapshotUpdate(snapshot=new_snapshot),))
+
+    assert new_metadata.snapshots[-1] == new_snapshot
+    assert new_metadata.last_sequence_number == last_sequence_number
+
+
+def test_update_metadata_add_snapshot_without_parent_cannot_lower_last_sequence_number(table_v2: Table) -> None:
+    new_snapshot = _snapshot_without_parent(table_v2.metadata.last_sequence_number - 1)
+
+    with pytest.raises(ValidationException, match="lower than last sequence number"):
+        update_table_metadata(table_v2.metadata, (AddSnapshotUpdate(snapshot=new_snapshot),))
 
 
 def test_update_metadata_set_ref_snapshot(table_v2: Table) -> None:
