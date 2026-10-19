@@ -1377,6 +1377,57 @@ class _SetFreshIDs(PreOrderSchemaVisitor[IcebergType]):
         return primitive
 
 
+def assign_fresh_schema_ids_for_replace(schema: Schema, base_schema: Schema, last_column_id: int) -> Schema:
+    """Assign field IDs to a schema that replaces `base_schema`.
+
+    A field keeps the ID of the field with the same full name and parent in `base_schema`. All
+    other fields get fresh IDs above `last_column_id`. Types are not compared, so a field whose
+    type changed still keeps its ID.
+
+    Args:
+        schema: The replacement schema.
+        base_schema: The schema to reuse field IDs from.
+        last_column_id: The highest field ID assigned so far.
+
+    Returns:
+        The replacement schema with the new field IDs.
+    """
+    # Field IDs can't be used to look up names until they are unique, e.g. a schema converted
+    # from PyArrow has -1 for every field ID.
+    schema = assign_fresh_schema_ids(schema)
+    base_ids_by_name = {name: field_id for field_id, name in base_schema._lazy_id_to_name.items()}
+    base_parents = base_schema._lazy_id_to_parent
+    parents = schema._lazy_id_to_parent
+    base_ids: dict[int, int] = {}
+    # Parents have lower IDs than their fields after assign_fresh_schema_ids, so they are matched first
+    for field_id, name in sorted(schema._lazy_id_to_name.items()):
+        if (base_id := base_ids_by_name.get(name)) is None:
+            continue
+        # Names can contain dots, so the parent has to match too, e.g. a top-level "a.b" doesn't match b in struct a
+        if (parent_id := parents.get(field_id)) is None:
+            matches = base_id not in base_parents
+        else:
+            matches = parent_id in base_ids and base_parents.get(base_id) == base_ids[parent_id]
+        if matches:
+            base_ids[field_id] = base_id
+    counter = itertools.count(last_column_id + 1)
+    return pre_order_visit(schema, _SetFreshIDsFromBase(base_ids, lambda: next(counter)))
+
+
+class _SetFreshIDsFromBase(_SetFreshIDs):
+    """Traverses the schema and assigns the given base IDs, or monotonically increasing ids for fields without one."""
+
+    def __init__(self, base_ids: dict[int, int], next_id_func: Callable[[], int]) -> None:
+        super().__init__(next_id_func=next_id_func)
+        self.base_ids = base_ids
+
+    def _get_and_increment(self, current_id: int) -> int:
+        if (base_id := self.base_ids.get(current_id)) is None:
+            return super()._get_and_increment(current_id)
+        self.old_id_to_new_id[current_id] = base_id
+        return base_id
+
+
 # Implementation copied from Apache Iceberg repo.
 def make_compatible_name(name: str) -> str:
     """Make a field name compatible with Avro specification.
