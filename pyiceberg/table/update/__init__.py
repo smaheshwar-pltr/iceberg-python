@@ -354,9 +354,14 @@ def _(update: RemovePropertiesUpdate, base_metadata: TableMetadata, context: _Ta
 
 @_apply_table_update.register(AddSchemaUpdate)
 def _(update: AddSchemaUpdate, base_metadata: TableMetadata, context: _TableMetadataUpdateContext) -> TableMetadata:
+    existing_schema = base_metadata.schema_by_id(update.schema_.schema_id)
+    if existing_schema is not None and existing_schema != update.schema_:
+        raise CommitFailedException(f"Schema with id {update.schema_.schema_id} already exists")
+
     metadata_updates: dict[str, Any] = {
         "last_column_id": max(base_metadata.last_column_id, update.schema_.highest_field_id),
-        "schemas": base_metadata.schemas + [update.schema_],
+        # An identical schema with the same ID is not added twice
+        "schemas": base_metadata.schemas if existing_schema is not None else base_metadata.schemas + [update.schema_],
     }
 
     context.add_update(update)

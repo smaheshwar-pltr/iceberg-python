@@ -1045,6 +1045,18 @@ def test_apply_add_schema_update(table_v2: Table) -> None:
     assert test_context.is_added_schema(2)
 
 
+def test_stale_update_schema_in_transaction(table_v2: Table) -> None:
+    transaction = table_v2.transaction()
+    stale_update = transaction.update_schema().add_column(path="b", field_type=IntegerType())
+
+    # Adding and then deleting a column sets the current schema back to schema 1
+    transaction.update_schema().add_column(path="c", field_type=IntegerType()).commit()
+    transaction.update_schema().delete_column("c").commit()
+
+    with pytest.raises(CommitFailedException, match="last assigned field id has changed: expected 3, found 4"):
+        stale_update.commit()
+
+
 def test_update_metadata_table_schema(table_v2: Table) -> None:
     transaction = table_v2.transaction()
     update = transaction.update_schema()
