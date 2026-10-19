@@ -47,7 +47,7 @@ from pyiceberg.table.snapshots import Operation
 from pyiceberg.table.sorting import NullOrder, SortDirection, SortField, SortOrder
 from pyiceberg.table.update import AddSchemaUpdate, SetCurrentSchemaUpdate
 from pyiceberg.transforms import IdentityTransform
-from pyiceberg.typedef import Identifier
+from pyiceberg.typedef import Identifier, Record
 from pyiceberg.types import BooleanType, DoubleType, IntegerType, LongType, NestedField, StringType
 
 
@@ -846,6 +846,46 @@ def test_write_and_evolve(catalog: Catalog, format_version: int) -> None:
         txn.append(pa_table_with_column)
         txn.overwrite(pa_table_with_column)
         txn.delete("foo = 'a'")
+
+
+def test_dynamic_partition_overwrite_after_schema_update_in_transaction(catalog: Catalog) -> None:
+    catalog.create_namespace("default")
+    schema = Schema(NestedField(1, "id", LongType()), NestedField(2, "region", StringType()))
+    partition_spec = PartitionSpec(PartitionField(source_id=2, field_id=1000, transform=IdentityTransform(), name="region"))
+    tbl = catalog.create_table("default.dynamic_partition_overwrite_schema", schema=schema, partition_spec=partition_spec)
+    tbl.append(pa.table({"id": [1, 2], "region": ["eu", "us"]}))
+
+    with tbl.transaction() as txn:
+        with txn.update_schema() as update:
+            update.add_column("data", StringType())
+        txn.dynamic_partition_overwrite(pa.table({"id": [3], "region": ["eu"], "data": ["x"]}))
+
+    assert sorted(tbl.scan().to_arrow().to_pylist(), key=lambda row: row["id"]) == [
+        {"id": 2, "region": "us", "data": None},
+        {"id": 3, "region": "eu", "data": "x"},
+    ]
+
+
+def test_dynamic_partition_overwrite_after_spec_update_in_transaction(catalog: Catalog) -> None:
+    catalog.create_namespace("default")
+    schema = Schema(
+        NestedField(1, "id", LongType()), NestedField(2, "region", StringType()), NestedField(3, "city", StringType())
+    )
+    partition_spec = PartitionSpec(PartitionField(source_id=2, field_id=1000, transform=IdentityTransform(), name="region"))
+    tbl = catalog.create_table("default.dynamic_partition_overwrite_spec", schema=schema, partition_spec=partition_spec)
+    tbl.append(pa.table({"id": [1, 2], "region": ["eu", "us"], "city": ["Amsterdam", "Boston"]}))
+
+    with tbl.transaction() as txn:
+        with txn.update_spec() as update:
+            update.remove_field("region").add_identity("city")
+        txn.dynamic_partition_overwrite(pa.table({"id": [3, 4], "region": ["eu", "eu"], "city": ["Amsterdam", "Paris"]}))
+
+    assert sorted(tbl.scan().to_arrow()["id"].to_pylist()) == [2, 3, 4]
+    assert {(task.file.spec_id, task.file.partition) for task in tbl.scan().plan_files()} == {
+        (0, Record("us")),
+        (1, Record("Amsterdam")),
+        (1, Record("Paris")),
+    }
 
 
 # Merge manifests
