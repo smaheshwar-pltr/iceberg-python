@@ -1022,6 +1022,20 @@ def test_apply_remove_properties_update(table_v2: Table) -> None:
     assert new_metadata.properties == {"read.split.target.size": "134217728", "test_b": "test_b", "test_d": "test_d"}
 
 
+def test_apply_remove_properties_update_ignores_unset_keys(table_v2: Table) -> None:
+    base_metadata = table_v2.metadata
+
+    new_metadata_no_removal = update_table_metadata(base_metadata, (RemovePropertiesUpdate(removals=["test_a"]),))
+
+    assert base_metadata == new_metadata_no_removal
+
+    new_metadata = update_table_metadata(base_metadata, (RemovePropertiesUpdate(removals=["read.split.target.size", "test_a"]),))
+
+    assert base_metadata.properties == {"read.split.target.size": "134217728"}
+    assert new_metadata.properties == {}
+    assert new_metadata.last_updated_ms > base_metadata.last_updated_ms
+
+
 def test_apply_add_schema_update(table_v2: Table) -> None:
     transaction = table_v2.transaction()
     update = transaction.update_schema()

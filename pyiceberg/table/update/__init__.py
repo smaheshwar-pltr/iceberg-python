@@ -341,12 +341,13 @@ def _(update: SetPropertiesUpdate, base_metadata: TableMetadata, context: _Table
 
 @_apply_table_update.register(RemovePropertiesUpdate)
 def _(update: RemovePropertiesUpdate, base_metadata: TableMetadata, context: _TableMetadataUpdateContext) -> TableMetadata:
-    if len(update.removals) == 0:
-        return base_metadata
-
     properties = dict(base_metadata.properties)
     for key in update.removals:
-        properties.pop(key)
+        # Ignore keys that aren't set, since a concurrent commit may have removed them
+        properties.pop(key, None)
+
+    if len(properties) == len(base_metadata.properties):
+        return base_metadata
 
     context.add_update(update)
     return base_metadata.model_copy(update={"properties": properties})
