@@ -31,6 +31,7 @@ from pyiceberg.schema import (
     SchemaVisitor,
     SchemaWithPartnerVisitor,
     assign_fresh_schema_ids,
+    index_by_id,
     promote,
     visit,
     visit_with_partner,
@@ -232,6 +233,12 @@ class UpdateSchema(UpdateTableMetadata["UpdateSchema"]):
                 raise ValueError(f"Invalid default value: {e}") from e
         else:
             initial_default = default_value  # type: ignore
+
+        has_initial_default = initial_default is not None or any(
+            nested_field.initial_default is not None for nested_field in index_by_id(new_type).values()
+        )
+        if has_initial_default and self._transaction.table_metadata.format_version < 3:
+            raise ValueError(f"Cannot add column {full_name}: initial defaults are only supported in format version 3 or higher")
 
         if (required and initial_default is None) and not self._allow_incompatible_changes:
             # Table format version 1 and 2 cannot add required column because there is no initial value
