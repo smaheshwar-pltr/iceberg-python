@@ -14,6 +14,8 @@
 #  KIND, either express or implied.  See the License for the
 #  specific language governing permissions and limitations
 #  under the License.
+from collections.abc import Callable
+from typing import Any
 from unittest import mock
 
 import boto3
@@ -23,6 +25,8 @@ from moto import mock_aws
 
 from pyiceberg.catalog.glue import GLUE_CONNECTION_S3_TABLES, GlueCatalog
 from pyiceberg.exceptions import (
+    CommitFailedException,
+    CommitStateUnknownException,
     NamespaceAlreadyExistsError,
     NamespaceNotEmptyError,
     NoSuchIcebergTableError,
@@ -93,6 +97,36 @@ def _patch_moto_for_s3tables(monkeypatch: pytest.MonkeyPatch) -> None:
     # writes to succeed.
     s3 = boto3.client("s3", region_name="us-east-1")
     s3.create_bucket(Bucket=S3TABLES_WAREHOUSE_LOCATION)
+
+
+def _patch_moto_for_table_versions(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Patch moto to reject an UpdateTable with an outdated VersionId, as Glue does."""
+    from moto.core.exceptions import JsonRESTError
+    from moto.glue.responses import GlueResponse
+
+    _original_update_table = GlueResponse.update_table
+
+    def _update_table_with_version_check(self):  # type: ignore
+        table = self.glue_backend.get_table(self.parameters["DatabaseName"], self.parameters["TableInput"]["Name"])
+        version_id = table.as_dict()["VersionId"]
+        if self.parameters.get("VersionId", version_id) != version_id:
+            raise JsonRESTError("ConcurrentModificationException", "Update table failed due to concurrent modifications.")
+        return _original_update_table(self)
+
+    monkeypatch.setattr(GlueResponse, "update_table", _update_table_with_version_check)
+
+
+def _retry_update_table(catalog: GlueCatalog, before_retry: Callable[[], None] | None = None) -> None:
+    """Make the client send each UpdateTable request again, as when the response to the first attempt is lost."""
+
+    def needs_retry(attempts: int, **kwargs: Any) -> int | None:
+        if attempts > 1:
+            return None
+        if before_retry is not None:
+            before_retry()
+        return 0
+
+    catalog.glue.meta.events.register_first("needs-retry.glue.UpdateTable", needs_retry)
 
 
 @mock_aws
@@ -927,6 +961,106 @@ def test_commit_overwrite_table_snapshot_properties(
     assert summary["snapshot_prop_a"] is None
     assert summary["snapshot_prop_b"] == "test_prop_b"
     assert len(updated_table_metadata.metadata_log) == 2
+
+
+@mock_aws
+@pytest.mark.parametrize("concurrent_commit", [False, True])
+def test_commit_table_retried_update_that_landed(
+    monkeypatch: pytest.MonkeyPatch,
+    _bucket_initialize: None,
+    moto_endpoint_url: str,
+    table_schema_simple: Schema,
+    database_name: str,
+    table_name: str,
+    concurrent_commit: bool,
+) -> None:
+    _patch_moto_for_table_versions(monkeypatch)
+    properties = {"s3.endpoint": moto_endpoint_url, "warehouse": f"s3://{BUCKET_NAME}"}
+    identifier = (database_name, table_name)
+    test_catalog = GlueCatalog("glue", **properties)
+    test_catalog.create_namespace(namespace=database_name)
+    table = test_catalog.create_table(identifier, table_schema_simple, properties={"commit.retry.num-retries": "0"})
+    df = pa.Table.from_pylist([{"foo": "foo_val", "bar": 1, "baz": False}], schema=schema_to_pyarrow(table_schema_simple))
+
+    def commit_on_top() -> None:
+        # Another writer commits on top of the first attempt before the retry
+        GlueCatalog("glue", **properties).load_table(identifier).append(df)
+
+    # The first attempt lands, so Glue rejects the retry
+    _retry_update_table(test_catalog, before_retry=commit_on_top if concurrent_commit else None)
+    table.append(df)
+
+    assert test_catalog.load_table(identifier).scan().to_arrow().num_rows == (2 if concurrent_commit else 1)
+
+
+@mock_aws
+@pytest.mark.parametrize("retried", [False, True])
+def test_commit_table_concurrent_update(
+    monkeypatch: pytest.MonkeyPatch,
+    _bucket_initialize: None,
+    moto_endpoint_url: str,
+    table_schema_simple: Schema,
+    database_name: str,
+    table_name: str,
+    retried: bool,
+) -> None:
+    _patch_moto_for_table_versions(monkeypatch)
+    properties = {"s3.endpoint": moto_endpoint_url, "warehouse": f"s3://{BUCKET_NAME}"}
+    identifier = (database_name, table_name)
+    test_catalog = GlueCatalog("glue", **properties)
+    test_catalog.create_namespace(namespace=database_name)
+    table = test_catalog.create_table(identifier, table_schema_simple, properties={"commit.retry.num-retries": "0"})
+    df = pa.Table.from_pylist([{"foo": "foo_val", "bar": 1, "baz": False}], schema=schema_to_pyarrow(table_schema_simple))
+
+    def commit_concurrently(**kwargs: Any) -> None:
+        GlueCatalog("glue", **properties).load_table(identifier).append(df)
+
+    # Another writer commits after this commit loaded the table, so Glue rejects every attempt
+    test_catalog.glue.meta.events.register("before-call.glue.UpdateTable", commit_concurrently)
+    if retried:
+        _retry_update_table(test_catalog)
+
+    with pytest.raises(CommitFailedException, match="Glue detected concurrent update"):
+        table.append(df)
+
+    assert test_catalog.load_table(identifier).scan().to_arrow().num_rows == 1
+
+
+@mock_aws
+@pytest.mark.parametrize("retried", [False, True])
+def test_commit_table_update_conflict_with_unknown_status(
+    monkeypatch: pytest.MonkeyPatch,
+    _bucket_initialize: None,
+    moto_endpoint_url: str,
+    table_schema_simple: Schema,
+    database_name: str,
+    table_name: str,
+    retried: bool,
+) -> None:
+    _patch_moto_for_table_versions(monkeypatch)
+    properties = {"s3.endpoint": moto_endpoint_url, "warehouse": f"s3://{BUCKET_NAME}"}
+    identifier = (database_name, table_name)
+    test_catalog = GlueCatalog("glue", **properties)
+    test_catalog.create_namespace(namespace=database_name)
+    table = test_catalog.create_table(identifier, table_schema_simple, properties={"commit.retry.num-retries": "0"})
+    df = pa.Table.from_pylist([{"foo": "foo_val", "bar": 1, "baz": False}], schema=schema_to_pyarrow(table_schema_simple))
+
+    def commit_concurrently(**kwargs: Any) -> None:
+        GlueCatalog("glue", **properties).load_table(identifier).append(df)
+
+    def drop_table(**kwargs: Any) -> None:
+        GlueCatalog("glue", **properties).drop_table(identifier)
+
+    if retried:
+        _retry_update_table(test_catalog)
+    else:
+        test_catalog.glue.meta.events.register("before-call.glue.UpdateTable", commit_concurrently)
+    # The table is dropped before the commit status can be checked
+    test_catalog.glue.meta.events.register("after-call.glue.UpdateTable", drop_table)
+
+    # Only an update that was retried can have landed, so the status is only checked then
+    with pytest.raises(CommitStateUnknownException if retried else CommitFailedException):
+        table.append(df)
 
 
 @mock_aws
