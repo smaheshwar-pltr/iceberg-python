@@ -49,6 +49,7 @@ from pyiceberg.table import (
     DOWNCAST_NS_TIMESTAMP_TO_US_ON_WRITE,
     CommitTableResponse,
     CreateTableTransaction,
+    ReplaceTableTransaction,
     StagedTable,
     Table,
     TableProperties,
@@ -443,6 +444,39 @@ class Catalog(ABC):
             return self.create_table(identifier, schema, location, partition_spec, sort_order, properties)
         except TableAlreadyExistsError:
             return self.load_table(identifier)
+
+    def replace_table_transaction(
+        self,
+        identifier: str | Identifier,
+        schema: Schema | pa.Schema,
+        location: str | None = None,
+        partition_spec: PartitionSpec = UNPARTITIONED_PARTITION_SPEC,
+        sort_order: SortOrder = UNSORTED_SORT_ORDER,
+        properties: Properties = EMPTY_DICT,
+    ) -> ReplaceTableTransaction:
+        """Create a ReplaceTableTransaction to replace the definition of an existing table.
+
+        The table keeps its UUID and history, but is empty unless data is written in the transaction.
+        Columns keep their field IDs when the new schema has a column with the same name.
+
+        Args:
+            identifier (str | Identifier): Table identifier.
+            schema (Schema): Table's new schema.
+            location (str | None): New location for the table. Defaults to the current location.
+            partition_spec (PartitionSpec): New PartitionSpec for the table. Defaults to unpartitioned.
+            sort_order (SortOrder): New SortOrder for the table. Defaults to unsorted.
+            properties (Properties): Table properties to set. Existing properties that are not set are kept.
+
+        Returns:
+            ReplaceTableTransaction: replaceTableTransaction instance.
+
+        Raises:
+            NoSuchTableError: If a table with the name does not exist.
+        """
+        table = self.load_table(identifier)
+        format_version = int(properties.get(TableProperties.FORMAT_VERSION, table.format_version))
+        iceberg_schema = self._convert_schema_if_needed(schema, cast(TableVersion, format_version))
+        return ReplaceTableTransaction(table, iceberg_schema, location, partition_spec, sort_order, properties)
 
     @abstractmethod
     def load_table(self, identifier: str | Identifier) -> Table:

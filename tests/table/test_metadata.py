@@ -880,6 +880,37 @@ def test_new_table_metadata_format_v2_with_v3_schema_fails(field_type: Primitive
         )
 
 
+def test_new_table_metadata_keeps_default_values() -> None:
+    schema = Schema(
+        NestedField(field_id=10, name="id", field_type=LongType(), required=False, initial_default=1, write_default=2)
+    )
+
+    actual = new_table_metadata(
+        schema=schema,
+        partition_spec=PartitionSpec(),
+        sort_order=SortOrder(),
+        location="s3://some_v1_location/",
+        properties={"format-version": "3"},
+    )
+
+    assert actual.schema() == Schema(
+        NestedField(field_id=1, name="id", field_type=LongType(), required=False, initial_default=1, write_default=2)
+    )
+
+
+def test_new_table_metadata_format_v2_with_initial_default_fails() -> None:
+    schema = Schema(NestedField(field_id=10, name="id", field_type=LongType(), required=False, initial_default=1))
+
+    with pytest.raises(ValueError, match="Initial default of id is only supported in 3 or higher. Current format version is: 2"):
+        new_table_metadata(
+            schema=schema,
+            partition_spec=PartitionSpec(),
+            sort_order=SortOrder(),
+            location="s3://some_v1_location/",
+            properties={"format-version": "2"},
+        )
+
+
 def test_encrypted_key_minimal() -> None:
     # Mirrors Java's TestEncryptedKeyParser, where the key metadata is base64 of b"key"
     key = EncryptedKey.model_validate_json('{"key-id": "a", "encrypted-key-metadata": "a2V5"}')

@@ -57,6 +57,7 @@ from pyiceberg.manifest import (
 )
 from pyiceberg.partitioning import PartitionSpec
 from pyiceberg.schema import Schema
+from pyiceberg.table.locations import LocationProvider, load_location_provider
 from pyiceberg.table.refs import MAIN_BRANCH, SnapshotRef, SnapshotRefType
 from pyiceberg.table.snapshots import (
     Operation,
@@ -330,8 +331,7 @@ class _SnapshotProducer(UpdateTableMetadata[U], Generic[U]):
             attempt=0,
             commit_uuid=self.commit_uuid,
         )
-        location_provider = self._transaction._table.location_provider()
-        manifest_list_file_path = location_provider.new_metadata_location(file_name)
+        manifest_list_file_path = self._location_provider().new_metadata_location(file_name)
         self._written_manifest_lists.append(manifest_list_file_path)
 
         with write_manifest_list(
@@ -408,11 +408,15 @@ class _SnapshotProducer(UpdateTableMetadata[U], Generic[U]):
         )
 
     def new_manifest_output(self) -> OutputFile:
-        location_provider = self._transaction._table.location_provider()
         file_name = _new_manifest_file_name(num=next(self._manifest_num_counter), commit_uuid=self.commit_uuid)
-        file_path = location_provider.new_metadata_location(file_name)
+        file_path = self._location_provider().new_metadata_location(file_name)
         self._written_manifests.append(file_path)
         return self._io.new_output(file_path)
+
+    def _location_provider(self) -> LocationProvider:
+        # Use the metadata of the transaction, as for data files, in case it changed the location or properties
+        table_metadata = self._transaction.table_metadata
+        return load_location_provider(table_location=table_metadata.location, table_properties=table_metadata.properties)
 
     def fetch_manifest_entry(self, manifest: ManifestFile, discard_deleted: bool = True) -> list[ManifestEntry]:
         return manifest.fetch_manifest_entry(io=self._io, discard_deleted=discard_deleted)

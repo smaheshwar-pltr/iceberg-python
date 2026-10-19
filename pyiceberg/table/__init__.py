@@ -45,14 +45,20 @@ from pyiceberg.expressions.visitors import (
 )
 from pyiceberg.io import FileIO, load_file_io
 from pyiceberg.manifest import DataFile, DataFileContent, ManifestContent, ManifestEntry, ManifestEntryStatus, ManifestFile
-from pyiceberg.partitioning import PARTITION_FIELD_ID_START, UNPARTITIONED_PARTITION_SPEC, PartitionKey, PartitionSpec
-from pyiceberg.schema import Schema
+from pyiceberg.partitioning import (
+    PARTITION_FIELD_ID_START,
+    UNPARTITIONED_PARTITION_SPEC,
+    PartitionKey,
+    PartitionSpec,
+    assign_fresh_partition_spec_ids_for_replace,
+)
+from pyiceberg.schema import Schema, assign_fresh_schema_ids_for_replace
 from pyiceberg.table.delete_file_index import DeleteFileIndex
 from pyiceberg.table.inspect import InspectTable
 from pyiceberg.table.locations import LocationProvider, load_location_provider
 from pyiceberg.table.maintenance import MaintenanceTable
-from pyiceberg.table.metadata import INITIAL_SEQUENCE_NUMBER, TableMetadata
-from pyiceberg.table.name_mapping import NameMapping
+from pyiceberg.table.metadata import INITIAL_SEQUENCE_NUMBER, SUPPORTED_TABLE_FORMAT_VERSION, TableMetadata
+from pyiceberg.table.name_mapping import NameMapping, update_mapping
 from pyiceberg.table.refs import MAIN_BRANCH, SnapshotRef
 from pyiceberg.table.snapshots import (
     Operation,
@@ -62,16 +68,22 @@ from pyiceberg.table.snapshots import (
     is_ancestor_of,
     is_parent_ancestor_of,
 )
-from pyiceberg.table.sorting import UNSORTED_SORT_ORDER, SortOrder
+from pyiceberg.table.sorting import UNSORTED_SORT_ORDER, UNSORTED_SORT_ORDER_ID, SortOrder, assign_fresh_sort_order_ids
 from pyiceberg.table.update import (
     AddPartitionSpecUpdate,
     AddSchemaUpdate,
     AddSortOrderUpdate,
     AssertCreate,
+    AssertCurrentSchemaId,
+    AssertDefaultSortOrderId,
+    AssertDefaultSpecId,
+    AssertLastAssignedFieldId,
+    AssertLastAssignedPartitionId,
     AssertRefSnapshotId,
     AssertTableUUID,
     AssignUUIDUpdate,
     RemovePropertiesUpdate,
+    RemoveSnapshotRefUpdate,
     SetCurrentSchemaUpdate,
     SetDefaultSortOrderUpdate,
     SetDefaultSpecUpdate,
@@ -100,7 +112,7 @@ from pyiceberg.typedef import (
     Record,
     TableVersion,
 )
-from pyiceberg.types import strtobool
+from pyiceberg.types import NestedField, strtobool
 from pyiceberg.utils.concurrent import ExecutorFactory
 from pyiceberg.utils.config import Config
 from pyiceberg.utils.properties import property_as_bool, property_as_int
@@ -617,7 +629,7 @@ class Transaction:
         append_snapshot_commit_uuid = uuid.uuid4()
         data_files: list[DataFile] = list(
             _dataframe_to_data_files(
-                table_metadata=self._table.metadata, write_uuid=append_snapshot_commit_uuid, df=df, io=self._table.io
+                table_metadata=self.table_metadata, write_uuid=append_snapshot_commit_uuid, df=df, io=self._table.io
             )
         )
 
@@ -1279,6 +1291,198 @@ class CreateTableTransaction(Transaction):
                 updates=self._updates,
                 requirements=(AssertCreate(),),
             )
+
+        self._updates = ()
+        self._requirements = ()
+
+        return self._table
+
+
+def _new_fields_by_parent(schema: Schema, last_column_id: int) -> dict[int, list[NestedField]]:
+    """Return the fields with IDs above `last_column_id` that aren't nested in another such field, by parent ID."""
+    new_ids = {field_id for field_id in schema.field_ids if field_id > last_column_id}
+    fields_by_parent: dict[int, list[NestedField]] = {}
+    for field_id in sorted(new_ids):
+        if (parent_id := schema._lazy_id_to_parent.get(field_id, -1)) not in new_ids:
+            fields_by_parent.setdefault(parent_id, []).append(schema.find_field(field_id))
+    return fields_by_parent
+
+
+class ReplaceTableTransaction(Transaction):
+    """A transaction that replaces the definition of an existing table.
+
+    The table keeps its UUID and history, including its snapshots, schemas, partition specs, sort orders,
+    and refs other than the main branch. The main branch is removed, so the table is empty unless data
+    is written in the transaction, and the new schema, partition spec, sort order, location and
+    properties are set.
+    """
+
+    def __init__(
+        self,
+        table: Table,
+        schema: Schema,
+        location: str | None = None,
+        partition_spec: PartitionSpec = UNPARTITIONED_PARTITION_SPEC,
+        sort_order: SortOrder = UNSORTED_SORT_ORDER,
+        properties: Properties = EMPTY_DICT,
+    ):
+        """Open a transaction to replace the definition of a table.
+
+        Args:
+            table: The table to replace.
+            schema: The new schema.
+            location: The new location, defaults to the current location.
+            partition_spec: The new partition spec, with source IDs referencing `schema`.
+            sort_order: The new sort order, with source IDs referencing `schema`.
+            properties: The properties to set. Existing properties that are not set are kept.
+        """
+        super().__init__(table, autocommit=False)
+        self._replaced = False
+        self._initial_changes(schema, location, partition_spec, sort_order, properties)
+
+    def _initial_changes(
+        self,
+        schema: Schema,
+        location: str | None,
+        partition_spec: PartitionSpec,
+        sort_order: SortOrder,
+        properties: Properties,
+    ) -> None:
+        """Set the initial changes that replace the definition of the table."""
+        base = self._table.metadata
+
+        format_version = int(properties.get(TableProperties.FORMAT_VERSION, base.format_version))
+        if format_version < base.format_version:
+            raise ValueError(f"Cannot downgrade v{base.format_version} table to v{format_version}")
+        elif format_version > base.format_version:
+            if format_version > SUPPORTED_TABLE_FORMAT_VERSION:
+                raise ValueError(f"Unsupported table format version: {format_version}")
+            self._updates += (UpgradeFormatVersionUpdate(format_version=format_version),)
+
+        # Also when the table has no main branch, so that the replace drops a concurrently created one
+        self._updates += (RemoveSnapshotRefUpdate(ref_name=MAIN_BRANCH),)
+
+        fresh_schema = assign_fresh_schema_ids_for_replace(schema, base.schema(), base.last_column_id)
+        fresh_schema.check_format_version_compatibility(format_version)
+        if (schema_id := next((s.schema_id for s in base.schemas if s == fresh_schema), None)) is not None:
+            self._updates += (SetCurrentSchemaUpdate(schema_id=schema_id),)
+        else:
+            new_schema = Schema(
+                *fresh_schema.fields,
+                schema_id=max(s.schema_id for s in base.schemas) + 1,
+                identifier_field_ids=fresh_schema.identifier_field_ids,
+            )
+            self._updates += (AddSchemaUpdate(schema_=new_schema), SetCurrentSchemaUpdate(schema_id=-1))
+
+        fresh_spec = assign_fresh_partition_spec_ids_for_replace(
+            partition_spec,
+            schema,
+            fresh_schema,
+            format_version=base.format_version,
+            current_spec=base.spec(),
+            specs=base.partition_specs,
+            last_partition_id=base.last_partition_id or PARTITION_FIELD_ID_START - 1,
+        )
+        fresh_spec.check_compatible(fresh_schema)
+        if (spec_id := next((s.spec_id for s in base.partition_specs if fresh_spec.compatible_with(s)), None)) is not None:
+            self._updates += (SetDefaultSpecUpdate(spec_id=spec_id),)
+        else:
+            new_spec = PartitionSpec(*fresh_spec.fields, spec_id=max(s.spec_id for s in base.partition_specs) + 1)
+            self._updates += (AddPartitionSpecUpdate(spec=new_spec), SetDefaultSpecUpdate(spec_id=-1))
+
+        fresh_sort_order = assign_fresh_sort_order_ids(sort_order, schema, fresh_schema)
+        fresh_sort_order.check_compatible(fresh_schema)
+        if fresh_sort_order.is_unsorted:
+            # A table created with a sort order has no unsorted order
+            if base.sort_order_by_id(UNSORTED_SORT_ORDER_ID) is None:
+                self._updates += (AddSortOrderUpdate(sort_order=UNSORTED_SORT_ORDER),)
+            # Set by ID since -1 resolves to the highest order ID, which the unsorted order may not have
+            self._updates += (SetDefaultSortOrderUpdate(sort_order_id=UNSORTED_SORT_ORDER_ID),)
+        elif (
+            sort_order_id := next((o.order_id for o in base.sort_orders if o.fields == fresh_sort_order.fields), None)
+        ) is not None:
+            self._updates += (SetDefaultSortOrderUpdate(sort_order_id=sort_order_id),)
+        else:
+            new_sort_order = SortOrder(
+                *fresh_sort_order.fields,
+                order_id=max((o.order_id for o in base.sort_orders), default=UNSORTED_SORT_ORDER_ID) + 1,
+            )
+            self._updates += (AddSortOrderUpdate(sort_order=new_sort_order), SetDefaultSortOrderUpdate(sort_order_id=-1))
+
+        new_location = location.rstrip("/") if location else base.location
+        if new_location != base.location:
+            self._updates += (SetLocationUpdate(location=new_location),)
+
+        updates = {key: value for key, value in properties.items() if key != TableProperties.FORMAT_VERSION}
+        if (name_mapping := base.name_mapping()) is not None and (
+            adds := _new_fields_by_parent(fresh_schema, base.last_column_id)
+        ):
+            # Map the new columns, as UpdateSchema does, so that files without field IDs can be read
+            updates = {TableProperties.DEFAULT_NAME_MAPPING: update_mapping(name_mapping, {}, adds).model_dump_json(), **updates}
+        if updates:
+            self._updates += (SetPropertiesUpdate(updates=updates),)
+
+    def _replace_requirements(self) -> tuple[TableRequirement, ...]:
+        """Return the requirements to replace the table, based on the updates."""
+        base = self._table.metadata
+        requirements: tuple[TableRequirement, ...] = (AssertTableUUID(uuid=base.table_uuid),)
+        # Adding a schema, spec or sort order also requires the current one to be unchanged. Their IDs are taken from
+        # the base metadata and aren't reassigned when the updates are applied, so this makes a concurrent addition,
+        # which normally also changes the current one, fail the commit instead of clashing with its ID
+        if any(isinstance(update, AddSchemaUpdate) for update in self._updates):
+            requirements += (
+                AssertLastAssignedFieldId(last_assigned_field_id=base.last_column_id),
+                AssertCurrentSchemaId(current_schema_id=base.current_schema_id),
+            )
+        if any(isinstance(update, AddPartitionSpecUpdate) for update in self._updates):
+            requirements += (
+                AssertLastAssignedPartitionId(last_assigned_partition_id=base.last_partition_id),
+                AssertDefaultSpecId(default_spec_id=base.default_spec_id),
+            )
+        if any(isinstance(update, AddSortOrderUpdate) for update in self._updates):
+            requirements += (AssertDefaultSortOrderId(default_sort_order_id=base.default_sort_order_id),)
+        # Refs other than main that the transaction writes or removes must be unchanged too, so that a concurrent commit
+        # to them isn't lost
+        ref_updates = (SetSnapshotRefUpdate, RemoveSnapshotRefUpdate)
+        for ref_name in dict.fromkeys(update.ref_name for update in self._updates if isinstance(update, ref_updates)):
+            if ref_name != MAIN_BRANCH:
+                ref = base.refs.get(ref_name)
+                requirements += (AssertRefSnapshotId(ref=ref_name, snapshot_id=ref.snapshot_id if ref else None),)
+        return requirements
+
+    def commit_transaction(self) -> Table:
+        """Commit the changes to the catalog.
+
+        In the case of a ReplaceTableTransaction, the requirements are derived from the updates. The
+        requirements of the operations in the transaction are dropped, as they apply to the new
+        definition of the table rather than to the table in the catalog. Once the table is replaced,
+        later changes in the transaction are committed like those of any other transaction.
+
+        Returns:
+            The table with the updates applied.
+        """
+        if self._replaced:
+            return super().commit_transaction()
+        if self._failed:
+            raise RuntimeError("This transaction failed to commit and cannot be reused; create a new transaction.")
+        if len(self._updates) > 0:
+            try:
+                try:
+                    self._table._do_commit(  # pylint: disable=W0212
+                        updates=self._updates,
+                        requirements=self._replace_requirements(),
+                    )
+                except (CommitFailedException, ValidationException):
+                    # The commit did not land, so it is safe to delete the files written for it
+                    for producer in self._snapshot_producers:
+                        producer._clean_all_uncommitted()
+                    raise
+            except Exception:
+                self._failed = True
+                raise
+
+            self._snapshot_producers = []
+            self._replaced = True
 
         self._updates = ()
         self._requirements = ()

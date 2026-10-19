@@ -185,6 +185,19 @@ with catalog.create_table_transaction(identifier="docs_example.bids", schema=sch
     txn.set_properties(test_a="test_aa", test_b="test_b", test_c="test_c")
 ```
 
+## Replace a table
+
+To replace the schema, partition specification, sort order, location and properties of an existing table, use `replace_table_transaction`. Unlike dropping and recreating the table, the table keeps its UUID and history, so earlier snapshots can still be read with time travel. The `main` branch is removed, so the table is empty unless data is written in the transaction, while other branches and tags are kept. For example, to atomically replace a table with the contents of a PyArrow table `df`:
+
+```python
+with catalog.replace_table_transaction(identifier="docs_example.bids", schema=df.schema) as txn:
+    txn.append(df)
+```
+
+Columns keep their field IDs when the new schema has a column with the same name, and the other columns get new field IDs.
+
+Omitting `partition_spec` or `sort_order` makes the table unpartitioned or unsorted, while omitting `location` keeps the current location. A PyArrow schema has no field IDs for them to reference, so use `update_spec` and `update_sort_order` in the transaction instead. The given properties are added to the existing properties of the table, which are kept. To remove a property, use `remove_properties` in the transaction. Pass `format-version` in the properties to upgrade the table as part of the replace.
+
 ## Register a table
 
 To register a table using existing metadata:
