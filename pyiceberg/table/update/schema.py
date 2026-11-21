@@ -189,6 +189,17 @@ class UpdateSchema(UpdateTableMetadata["UpdateSchema"]):
         Returns:
             This for method chaining.
         """
+        return self._add_column(path, field_type, doc, required, initial_default=default_value, write_default=default_value)
+
+    def _add_column(
+        self,
+        path: str | tuple[str, ...],
+        field_type: IcebergType,
+        doc: str | None,
+        required: bool,
+        initial_default: L | None,
+        write_default: L | None,
+    ) -> UpdateSchema:
         if isinstance(path, str):
             if "." in path:
                 raise ValueError(f"Cannot add column with ambiguous name: {path}, provide a tuple instead")
@@ -223,14 +234,14 @@ class UpdateSchema(UpdateTableMetadata["UpdateSchema"]):
         new_id = self.assign_new_column_id()
         new_type = assign_fresh_schema_ids(field_type, self.assign_new_column_id)
 
-        if default_value is not None:
-            try:
-                # To make sure that the value is valid for the type
-                initial_default = literal(default_value).to(new_type).value
-            except ValueError as e:
-                raise ValueError(f"Invalid default value: {e}") from e
-        else:
-            initial_default = default_value  # type: ignore
+        try:
+            # To make sure that the values are valid for the type
+            if initial_default is not None:
+                initial_default = literal(initial_default).to(new_type).value
+            if write_default is not None:
+                write_default = literal(write_default).to(new_type).value
+        except ValueError as e:
+            raise ValueError(f"Invalid default value: {e}") from e
 
         has_initial_default = initial_default is not None or any(
             nested_field.initial_default is not None for nested_field in index_by_id(new_type).values()
@@ -238,8 +249,8 @@ class UpdateSchema(UpdateTableMetadata["UpdateSchema"]):
         if has_initial_default and self._transaction.table_metadata.format_version < 3:
             raise ValueError(f"Cannot add column {full_name}: initial defaults are only supported in format version 3 or higher")
 
-        if (required and initial_default is None) and not self._allow_incompatible_changes:
-            # Table format version 1 and 2 cannot add required column because there is no initial value
+        if required and (initial_default is None or write_default is None) and not self._allow_incompatible_changes:
+            # A required column needs an initial default for existing rows and a write default for new ones
             raise ValueError(f"Incompatible change: cannot add required column: {'.'.join(path)}")
 
         # update tracking for moves
@@ -253,7 +264,7 @@ class UpdateSchema(UpdateTableMetadata["UpdateSchema"]):
             required=required,
             doc=doc,
             initial_default=initial_default,
-            write_default=initial_default,
+            write_default=write_default,
         )
 
         if parent_id in self._adds:
@@ -891,7 +902,14 @@ class _UnionByNameVisitor(SchemaWithPartnerVisitor[int, bool]):
         else:
             path = (field.name,)
 
-        self.update_schema.add_column(path=path, field_type=field.field_type, required=field.required, doc=field.doc)
+        self.update_schema._add_column(
+            path=path,
+            field_type=field.field_type,
+            doc=field.doc,
+            required=field.required,
+            initial_default=field.initial_default,
+            write_default=field.write_default,
+        )
 
     def _update_column(self, field: NestedField, existing_field: NestedField) -> None:
         full_name = self.existing_schema.find_column_name(existing_field.field_id)

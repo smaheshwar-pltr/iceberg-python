@@ -138,6 +138,55 @@ def test_update_schema_keeps_write_default_before_v3(catalog: Catalog, test_tabl
     assert (child.initial_default, child.write_default) == (None, 9)
 
 
+@pytest.mark.parametrize("format_version", [1, 2])
+def test_union_by_name_keeps_write_default_before_v3(catalog: Catalog, format_version: int) -> None:
+    identifier = f"default.union_by_name_write_default_v{format_version}"
+    catalog.create_namespace("default")
+    existing_field = NestedField(field_id=2, name="a", field_type=LongType(), required=False)
+    table = catalog.create_table(
+        identifier,
+        Schema(NestedField(field_id=1, name="s", field_type=StructType(existing_field), required=False)),
+        properties={"format-version": str(format_version)},
+    )
+    new_schema = Schema(
+        NestedField(
+            field_id=1,
+            name="s",
+            field_type=StructType(
+                existing_field, NestedField(field_id=3, name="b", field_type=LongType(), required=False, write_default=8)
+            ),
+            required=False,
+        ),
+        NestedField(field_id=4, name="c", field_type=LongType(), required=False, write_default=9),
+    )
+
+    table.update_schema().union_by_name(new_schema).commit()
+
+    assert catalog.load_table(identifier).schema().as_struct() == new_schema.as_struct()
+
+
+@pytest.mark.parametrize("format_version", [1, 2])
+def test_union_by_name_rejects_initial_default_before_v3(catalog: Catalog, format_version: int) -> None:
+    identifier = f"default.union_by_name_initial_default_v{format_version}"
+    catalog.create_namespace("default")
+    existing_field = NestedField(field_id=2, name="a", field_type=LongType(), required=False)
+    table = catalog.create_table(
+        identifier,
+        Schema(NestedField(field_id=1, name="s", field_type=StructType(existing_field), required=False)),
+        properties={"format-version": str(format_version)},
+    )
+    added_field = NestedField(field_id=3, name="b", field_type=LongType(), required=False, initial_default=7)
+
+    for column, new_schema in [
+        ("b", Schema(*table.schema().fields, added_field)),
+        ("s.b", Schema(NestedField(field_id=1, name="s", field_type=StructType(existing_field, added_field), required=False))),
+    ]:
+        with pytest.raises(ValueError, match=f"Cannot add column {column}: initial defaults are only supported in format"):
+            table.update_schema().union_by_name(new_schema).commit()
+
+    assert catalog.load_table(identifier).schema() == table.schema()
+
+
 def test_create_table_if_not_exists_duplicated_table(
     catalog: Catalog, table_schema_nested: Schema, test_table_identifier: Identifier
 ) -> None:

@@ -1803,6 +1803,38 @@ def test_union_with_pa_schema(primitive_fields: NestedField, table_v2: Table) ->
     assert new_schema == expected_schema
 
 
+def test_union_keeps_default_values(table_v3: Table) -> None:
+    current_schema = Schema(NestedField(field_id=1, name="aStruct", field_type=StructType(), required=False))
+    new_schema = Schema(
+        NestedField(
+            field_id=1,
+            name="aStruct",
+            field_type=StructType(
+                NestedField(field_id=2, name="nested", field_type=LongType(), required=False, initial_default=1, write_default=2)
+            ),
+            required=False,
+        ),
+        NestedField(field_id=3, name="both", field_type=LongType(), required=True, initial_default=3, write_default=4),
+        NestedField(field_id=4, name="write_only", field_type=StringType(), required=False, write_default="a"),
+    )
+
+    applied = UpdateSchema(transaction=Transaction(table_v3), schema=current_schema).union_by_name(new_schema)._apply()
+
+    assert applied.as_struct() == new_schema.as_struct()
+
+
+def test_union_rejects_invalid_default_values(table_v3: Table) -> None:
+    for new_field, match in [
+        (
+            NestedField(field_id=1, name="x", field_type=LongType(), required=True, initial_default=1),
+            "Incompatible change: cannot add required column: x",
+        ),
+        (NestedField(field_id=1, name="x", field_type=LongType(), required=False, write_default="abc"), "Invalid default value"),
+    ]:
+        with pytest.raises(ValueError, match=match):
+            UpdateSchema(transaction=Transaction(table_v3), schema=Schema()).union_by_name(Schema(new_field))
+
+
 def test_rename_struct_containing_identifier_field(table_v2: Table) -> None:
     schema = Schema(
         NestedField(
