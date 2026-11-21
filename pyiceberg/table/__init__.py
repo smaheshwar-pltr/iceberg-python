@@ -1270,9 +1270,10 @@ class Transaction:
         """
         from pyiceberg.table.update.snapshot import CommitWindow
 
-        windows: dict[str | None, CommitWindow] = {}
+        windows: dict[str, CommitWindow] = {}
         for producer in self._snapshot_producers:
-            branch = producer._target_branch
+            # Staged snapshots are produced on top of main
+            branch = producer._target_branch if producer._target_branch is not None else MAIN_BRANCH
             if branch not in windows:
                 windows[branch] = CommitWindow.resolve(self._table.metadata, producer._starting_snapshot_id, branch)
             producer._commit_window = windows[branch]

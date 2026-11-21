@@ -24,6 +24,7 @@ from pyiceberg.catalog import Catalog
 from pyiceberg.exceptions import CommitFailedException, CommitStateUnknownException, ValidationException
 from pyiceberg.schema import Schema
 from pyiceberg.table import Table, TableProperties, Transaction
+from pyiceberg.table.refs import MAIN_BRANCH
 from pyiceberg.table.snapshots import IsolationLevel, Operation
 from pyiceberg.typedef import Record
 from pyiceberg.types import DoubleType, LongType, NestedField, StringType
@@ -1798,3 +1799,45 @@ def test_retry_with_two_writes_to_one_branch_succeeds(catalog: Catalog) -> None:
 
     rows = sorted(catalog.load_table("default.retry_two_writes_one_branch").scan().to_arrow()["x"].to_pylist())
     assert rows == [1, 5, 9]
+
+
+@pytest.mark.parametrize("first_branch", [MAIN_BRANCH, None], ids=["main", "staged"])
+def test_transaction_writes_first_snapshot_and_new_branch_to_empty_table(catalog: Catalog, first_branch: str | None) -> None:
+    """A transaction that writes the first snapshot to main, or stages it, can also write a new branch."""
+    import pyarrow as pa
+
+    catalog.create_namespace("default")
+    table = catalog.create_table("default.empty_two_branch_test", schema=_test_schema())
+
+    # On its own, a new branch cannot be written to an empty table
+    with pytest.raises(CommitFailedException, match="Table has no snapshots and can only be written to the main BRANCH"):
+        table.append(pa.table({"x": [2]}), branch="test-branch")
+
+    tx = table.transaction()
+    tx.append(pa.table({"x": [1]}), branch=first_branch)
+    tx.append(pa.table({"x": [2]}), branch="test-branch")
+    tx.commit_transaction()
+
+    refreshed = catalog.load_table("default.empty_two_branch_test")
+    assert refreshed.scan().to_arrow().column("x").to_pylist() == ([1] if first_branch == MAIN_BRANCH else [])
+    assert refreshed.scan().use_ref("test-branch").to_arrow().column("x").to_pylist() == [2]
+    assert len(refreshed.snapshots()) == 2
+
+
+def test_transaction_retries_staged_snapshot_against_concurrent_commits_to_main(catalog: Catalog) -> None:
+    """A staged snapshot is produced on top of main, so on retry it is checked against the commits to main."""
+    import pyarrow as pa
+
+    catalog.create_namespace("default")
+    table = catalog.create_table("default.staged_retry_test", schema=_test_schema())
+    table.append(pa.table({"x": [1]}))
+
+    tx = catalog.load_table("default.staged_retry_test").transaction()
+    tx.append(pa.table({"x": [2]}))
+    tx.append(pa.table({"x": [3]}), branch=None)
+    catalog.load_table("default.staged_retry_test").append(pa.table({"x": [4]}))
+    tx.commit_transaction()
+
+    refreshed = catalog.load_table("default.staged_retry_test")
+    assert sorted(refreshed.scan().to_arrow().column("x").to_pylist()) == [1, 2, 4]
+    assert len(refreshed.snapshots()) == 4
