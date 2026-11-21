@@ -27,7 +27,7 @@ from pytest_lazy_fixtures import lf
 
 from pyiceberg.catalog import Catalog
 from pyiceberg.catalog.noop import NoopCatalog
-from pyiceberg.exceptions import CommitFailedException
+from pyiceberg.exceptions import CommitFailedException, ValidationException
 from pyiceberg.expressions import (
     AlwaysTrue,
     And,
@@ -2460,10 +2460,50 @@ def test_add_snapshot_update_fails_with_stale_sequence_number(table: Table) -> N
     )
 
     with pytest.raises(
-        ValueError,
+        CommitFailedException,
         match=(
             f"Cannot add snapshot with sequence number {last_sequence_number} "
             f"older than last sequence number {last_sequence_number}"
+        ),
+    ):
+        update_table_metadata(table.metadata, (AddSnapshotUpdate(snapshot=new_snapshot),))
+
+
+def _snapshot_without_parent(sequence_number: int) -> Snapshot:
+    return Snapshot(
+        snapshot_id=25,
+        parent_snapshot_id=None,
+        sequence_number=sequence_number,
+        timestamp_ms=1602638593590,
+        manifest_list="s3:/a/b/c.avro",
+        summary=Summary(Operation.APPEND),
+        schema_id=1,
+        first_row_id=2,
+        added_rows=10,
+    )
+
+
+@pytest.mark.parametrize("table", [lf("table_v2"), lf("table_v3")])
+def test_add_snapshot_update_without_parent_with_last_sequence_number(table: Table) -> None:
+    last_sequence_number = table.metadata.last_sequence_number
+    new_snapshot = _snapshot_without_parent(last_sequence_number)
+
+    new_metadata = update_table_metadata(table.metadata, (AddSnapshotUpdate(snapshot=new_snapshot),))
+
+    assert new_metadata.snapshots[-1] == new_snapshot
+    assert new_metadata.last_sequence_number == last_sequence_number
+
+
+@pytest.mark.parametrize("table", [lf("table_v2"), lf("table_v3")])
+def test_add_snapshot_update_without_parent_fails_with_lower_sequence_number(table: Table) -> None:
+    last_sequence_number = table.metadata.last_sequence_number
+    new_snapshot = _snapshot_without_parent(last_sequence_number - 1)
+
+    with pytest.raises(
+        ValidationException,
+        match=(
+            f"Cannot add snapshot with sequence number {last_sequence_number - 1} "
+            f"lower than last sequence number {last_sequence_number}"
         ),
     ):
         update_table_metadata(table.metadata, (AddSnapshotUpdate(snapshot=new_snapshot),))
