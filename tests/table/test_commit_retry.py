@@ -15,6 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 import uuid
+from collections.abc import Callable
 from typing import Any
 from unittest.mock import patch
 
@@ -1643,6 +1644,61 @@ def test_lost_response_on_empty_table_overwrite_before_any_retry_keeps_the_lande
         table.overwrite(pa.table({"x": [1, 2, 3]}))
 
     _assert_single_readable_snapshot(catalog, "default.lost_response_empty_overwrite_no_retries", [{"x": 1}, {"x": 2}, {"x": 3}])
+
+
+def test_lost_response_with_some_added_snapshots_expired_keeps_the_landed_commit(catalog: Catalog) -> None:
+    """A landed commit is detected even if another writer expired some of its snapshots before the check."""
+    import pyarrow as pa
+
+    def expire_first(table: Table, added_snapshot_ids: list[int]) -> None:
+        # No ref points at the first snapshot once the second is committed on top of it
+        table.maintenance.expire_snapshots().by_id(added_snapshot_ids[0]).commit()
+
+    def append_on_top_and_expire_last(table: Table, added_snapshot_ids: list[int]) -> None:
+        table.append(pa.table({"x": [9]}))
+        table.maintenance.expire_snapshots().by_id(added_snapshot_ids[-1]).commit()
+
+    def commit_two_appends_and_lose_response(
+        identifier: str, num_retries: int, concurrent_change: Callable[[Table, list[int]], None]
+    ) -> None:
+        table = catalog.create_table(
+            identifier,
+            schema=_test_schema(),
+            properties={
+                TableProperties.COMMIT_NUM_RETRIES: str(num_retries),
+                TableProperties.COMMIT_MIN_RETRY_WAIT_MS: "1",
+                TableProperties.COMMIT_MAX_RETRY_WAIT_MS: "2",
+            },
+        )
+        txn = table.transaction()
+        added_snapshot_ids: list[int] = []
+        for x in (1, 2):
+            txn.append(pa.table({"x": [x]}))
+            snapshot_id = txn.table_metadata.current_snapshot_id
+            assert snapshot_id is not None
+            added_snapshot_ids.append(snapshot_id)
+
+        real_commit = catalog.commit_table
+        calls: list[int] = []
+
+        def commit_change_then_lose_response(*args: Any, **kwargs: Any) -> Any:
+            calls.append(1)
+            result = real_commit(*args, **kwargs)
+            if len(calls) == 1:
+                concurrent_change(catalog.load_table(identifier), added_snapshot_ids)
+                raise CommitFailedException("response lost after the commit landed")
+            return result
+
+        with patch.object(catalog, "commit_table", side_effect=commit_change_then_lose_response):
+            txn.commit_transaction()
+
+    catalog.create_namespace("default")
+    for concurrent_change, expected in ((expire_first, [1, 2]), (append_on_top_and_expire_last, [1, 2, 9])):
+        # With no retries left the check runs before cleaning up, otherwise before committing again
+        for num_retries in (0, 1):
+            identifier = f"default.lost_response_{concurrent_change.__name__}_{num_retries}"
+            commit_two_appends_and_lose_response(identifier, num_retries, concurrent_change)
+            assert sorted(catalog.load_table(identifier).scan().to_arrow()["x"].to_pylist()) == expected, identifier
 
 
 def test_unreadable_commit_outcome_raises_commit_state_unknown(catalog: Catalog) -> None:
