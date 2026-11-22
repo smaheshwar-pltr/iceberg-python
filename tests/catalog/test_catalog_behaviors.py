@@ -47,8 +47,8 @@ from pyiceberg.table import Table, TableProperties
 from pyiceberg.table.snapshots import Operation
 from pyiceberg.table.sorting import NullOrder, SortDirection, SortField, SortOrder
 from pyiceberg.table.update import AddSchemaUpdate, SetCurrentSchemaUpdate
-from pyiceberg.transforms import BucketTransform, IdentityTransform
-from pyiceberg.typedef import Identifier
+from pyiceberg.transforms import BucketTransform, IdentityTransform, TruncateTransform
+from pyiceberg.typedef import Identifier, Record
 from pyiceberg.types import BooleanType, DoubleType, IntegerType, LongType, NestedField, StringType
 
 
@@ -1500,6 +1500,44 @@ def test_append_nan_to_identity_partitioned_table(catalog: Catalog) -> None:
 
     assert sorted(tbl.scan().to_arrow()["id"].to_pylist()) == [1, 2, 3, 4]
     assert sorted(tbl.scan(row_filter="value is nan").to_arrow()["id"].to_pylist()) == [2, 4]
+
+
+def test_append_with_partition_fields_on_one_source_column(catalog: Catalog) -> None:
+    catalog.create_namespace("default")
+    schema = Schema(NestedField(1, "a", LongType(), required=False), NestedField(2, "b", StringType(), required=False))
+    tables = [
+        catalog.create_table(
+            f"default.bucket_and_truncate_{catalog.name}",
+            schema,
+            partition_spec=PartitionSpec(
+                PartitionField(source_id=1, field_id=1000, transform=BucketTransform(4), name="a_bucket"),
+                PartitionField(source_id=1, field_id=1001, transform=TruncateTransform(10), name="a_trunc"),
+            ),
+        )
+    ]
+    for format_version in (1, 2):
+        tbl = catalog.create_table(
+            f"default.add_bucket_v{format_version}_{catalog.name}",
+            schema,
+            partition_spec=PartitionSpec(PartitionField(source_id=1, field_id=1000, transform=IdentityTransform(), name="a")),
+            properties={"format-version": str(format_version)},
+        )
+        with tbl.update_spec() as update:
+            if format_version == 1:
+                # v1 keeps the removed field as void(a)
+                update.remove_field("a")
+            update.add_field("a", BucketTransform(4), "a_bucket")
+        tables.append(tbl)
+
+    values = [1, 15, None]
+    for tbl in tables:
+        assert [field.source_id for field in tbl.spec().fields] == [1, 1]
+        tbl.append(pa.Table.from_pydict({"a": values, "b": ["x", "y", "z"]}, schema=schema_to_pyarrow(schema)))
+
+        expected = {Record(*[field.transform.transform(LongType())(value) for field in tbl.spec().fields]) for value in values}
+        assert {task.file.partition for task in tbl.scan().plan_files()} == expected
+        assert len(list(tbl.scan(row_filter="a = 15").plan_files())) == 1
+        assert tbl.scan(row_filter="a = 15").to_arrow()["b"].to_pylist() == ["y"]
 
 
 def _table_with_null_partition(catalog: Catalog, name: str, partition_spec: PartitionSpec) -> Table:
