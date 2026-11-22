@@ -395,6 +395,36 @@ def test_retried_append_with_a_spec_that_has_more_fields(catalog: Catalog) -> No
     assert refreshed.scan(row_filter="p == 7").to_arrow()["x"].to_pylist() == [3]
 
 
+def test_stale_spec_update_deletes_the_manifests_of_its_transaction(catalog: Catalog) -> None:
+    """A transaction that adds a spec whose ID another writer took fails as a conflict and deletes its manifests."""
+    catalog.create_namespace("default")
+
+    import pyarrow as pa
+
+    df = pa.table({"x": [1], "y": [2]})
+    table = catalog.create_table("default.stale_spec_test", schema=df.schema)
+    with table.update_spec() as update:
+        update.add_identity("x")
+
+    transaction = catalog.load_table("default.stale_spec_test").transaction()
+    with transaction.update_spec() as update:
+        update.add_identity("y")
+    transaction.append(df)
+    snapshot = transaction.table_metadata.current_snapshot()
+    assert snapshot is not None
+    written = [snapshot.manifest_list, *(manifest.manifest_path for manifest in snapshot.manifests(table.io))]
+
+    # Renaming a partition field and renaming it back adds spec 2 and sets the default spec back to spec 1
+    with table.update_spec() as update:
+        update.rename_field("x", "x2")
+    with table.update_spec() as update:
+        update.rename_field("x2", "x")
+
+    with pytest.raises(CommitFailedException, match="Partition spec with id 2 already exists"):
+        transaction.commit_transaction()
+    assert not any(table.io.new_input(path).exists() for path in written)
+
+
 def test_retry_exhaustion_raises_commit_failed(catalog: Catalog) -> None:
     """When retries are exhausted, CommitFailedException should be raised."""
     catalog.create_namespace("default")

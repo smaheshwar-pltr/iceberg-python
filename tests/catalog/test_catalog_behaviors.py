@@ -664,6 +664,40 @@ def test_catalog_commit_table_applies_schema_updates(
     assert response.metadata.current_schema_id == new_schema.schema_id
 
 
+def test_concurrent_commit_table_partition_spec_id_already_taken(
+    catalog: Catalog, table_schema_simple: Schema, test_table_identifier: Identifier
+) -> None:
+    namespace = Catalog.namespace_from(test_table_identifier)
+    catalog.create_namespace(namespace)
+    partition_spec = PartitionSpec(PartitionField(source_id=2, field_id=1000, transform=IdentityTransform(), name="bar"))
+    table_a = catalog.create_table(test_table_identifier, table_schema_simple, partition_spec=partition_spec)
+    table_b = catalog.load_table(test_table_identifier)
+
+    # Removing a partition field and adding it back adds spec 1 and sets the default spec back to spec 0
+    table_a.update_spec().remove_field("bar").commit()
+    table_a.update_spec().add_identity("bar").commit()
+    table_c = catalog.load_table(test_table_identifier)
+
+    # Renaming it and renaming it back adds spec 2 and sets the default spec back to spec 0
+    table_a.update_spec().rename_field("bar", "qux").commit()
+    table_a.update_spec().rename_field("qux", "bar").commit()
+
+    with pytest.raises(CommitFailedException, match="Partition spec with id 1 already exists"):
+        table_b.update_spec().add_identity("foo").commit()
+
+    # Removing the field and adding it back as qux gives it a new field ID, so this spec 2 only matches the table's
+    # spec 2 apart from field IDs
+    with pytest.raises(CommitFailedException, match="Partition spec with id 2 already exists"):
+        table_c.update_spec().remove_field("bar").add_field("bar", IdentityTransform(), "qux").commit()
+
+    # An identical spec is not added twice, even if it isn't the latest one
+    table_b.update_spec().remove_field("bar").commit()
+
+    table = catalog.load_table(test_table_identifier)
+    assert [spec.spec_id for spec in table.metadata.partition_specs] == [0, 1, 2]
+    assert table.metadata.default_spec_id == 1
+
+
 def test_concurrent_commit_table(catalog: Catalog, table_schema_nested: Schema, test_table_identifier: Identifier) -> None:
     namespace = Catalog.namespace_from(test_table_identifier)
     catalog.create_namespace(namespace)

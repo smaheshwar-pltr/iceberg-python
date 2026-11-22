@@ -284,8 +284,10 @@ class _TableMetadataUpdateContext:
     def is_added_schema(self, schema_id: int) -> bool:
         return any(update.schema_.schema_id == schema_id for update in self._updates if isinstance(update, AddSchemaUpdate))
 
-    def is_added_partition_spec(self, spec_id: int) -> bool:
-        return any(update.spec.spec_id == spec_id for update in self._updates if isinstance(update, AddPartitionSpecUpdate))
+    def last_added_partition_spec_id(self) -> int | None:
+        return next(
+            (update.spec.spec_id for update in reversed(self._updates) if isinstance(update, AddPartitionSpecUpdate)), None
+        )
 
     def is_added_sort_order(self, sort_order_id: int) -> bool:
         return any(
@@ -406,13 +408,15 @@ def _(update: SetCurrentSchemaUpdate, base_metadata: TableMetadata, context: _Ta
 
 @_apply_table_update.register(AddPartitionSpecUpdate)
 def _(update: AddPartitionSpecUpdate, base_metadata: TableMetadata, context: _TableMetadataUpdateContext) -> TableMetadata:
-    for spec in base_metadata.partition_specs:
-        # Only raise in case of a discrepancy
-        if spec.spec_id == update.spec.spec_id and spec != update.spec:
-            raise ValueError(f"Partition spec with id {spec.spec_id} already exists: {spec}")
+    existing_spec = base_metadata.specs().get(update.spec.spec_id)
+    if existing_spec is not None and existing_spec != update.spec:
+        # The spec can't take another ID, since files written against it record its ID
+        raise CommitFailedException(f"Partition spec with id {update.spec.spec_id} already exists")
 
+    # An identical spec with the same ID is not added twice
+    specs = base_metadata.partition_specs if existing_spec is not None else base_metadata.partition_specs + [update.spec]
     metadata_updates: dict[str, Any] = {
-        "partition_specs": base_metadata.partition_specs + [update.spec],
+        "partition_specs": specs,
         "last_partition_id": max(
             max([field.field_id for field in update.spec.fields], default=0),
             base_metadata.last_partition_id or PARTITION_FIELD_ID_START - 1,
@@ -427,9 +431,11 @@ def _(update: AddPartitionSpecUpdate, base_metadata: TableMetadata, context: _Ta
 def _(update: SetDefaultSpecUpdate, base_metadata: TableMetadata, context: _TableMetadataUpdateContext) -> TableMetadata:
     new_spec_id = update.spec_id
     if new_spec_id == -1:
-        new_spec_id = max(spec.spec_id for spec in base_metadata.partition_specs)
-        if not context.is_added_partition_spec(new_spec_id):
+        # Not necessarily the highest ID, since the added spec may already exist
+        last_added_spec_id = context.last_added_partition_spec_id()
+        if last_added_spec_id is None:
             raise ValueError("Cannot set current partition spec to last added one when no partition spec has been added")
+        new_spec_id = last_added_spec_id
     if new_spec_id == base_metadata.default_spec_id:
         return base_metadata
     found_spec_id = False
