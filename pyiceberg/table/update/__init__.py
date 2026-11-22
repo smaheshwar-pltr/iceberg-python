@@ -766,6 +766,15 @@ def update_table_metadata(
     new_metadata.spec().check_compatible(new_metadata.schema())
     new_metadata.sort_order().check_compatible(new_metadata.schema())
 
+    # v1 also stores the current schema and default spec in the legacy schema and partition-spec fields
+    if new_metadata.format_version == 1 and context.has_changes():
+        new_metadata = new_metadata.model_copy(
+            update={
+                "schema_": new_metadata.schema(),
+                "partition_spec": [field.model_dump() for field in new_metadata.spec().fields],
+            }
+        )
+
     if enforce_validation:
         return TableMetadataUtil.parse_obj(new_metadata.model_dump())
     else:

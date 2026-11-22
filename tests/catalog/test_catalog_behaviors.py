@@ -210,6 +210,60 @@ def test_create_v1_table(catalog: Catalog, table_schema_nested: Schema, test_tab
     catalog.drop_table(test_table_identifier)
 
 
+def test_v1_metadata_writes_current_schema_and_spec_to_legacy_fields(catalog: Catalog, table_schema_simple: Schema) -> None:
+    catalog.create_namespace("default")
+    identifier = "default.v1_table"
+    # A table created in a transaction builds its metadata from an empty placeholder schema and spec
+    table = catalog.create_table_transaction(
+        identifier,
+        table_schema_simple,
+        partition_spec=PartitionSpec(PartitionField(source_id=1, field_id=1000, transform=IdentityTransform(), name="foo")),
+        properties={"format-version": "1"},
+    ).commit_transaction()
+
+    def assert_legacy_fields(schema_names: list[str], spec_names: list[str]) -> None:
+        assert table.metadata == catalog.load_table(identifier).metadata
+        with table.io.new_input(table.metadata_location).open() as stream:
+            metadata = json.loads(stream.read())
+        current_schema = next(schema for schema in metadata["schemas"] if schema["schema-id"] == metadata["current-schema-id"])
+        default_spec = next(spec for spec in metadata["partition-specs"] if spec["spec-id"] == metadata["default-spec-id"])
+        assert metadata["schema"] == current_schema
+        assert metadata["partition-spec"] == default_spec["fields"]
+        assert [field["name"] for field in metadata["schema"]["fields"]] == schema_names
+        assert [field["name"] for field in metadata["partition-spec"]] == spec_names
+
+    assert_legacy_fields(["foo", "bar", "baz"], ["foo"])
+    with table.update_schema() as schema_update:
+        schema_update.add_column("qux", StringType())
+    assert_legacy_fields(["foo", "bar", "baz", "qux"], ["foo"])
+    # Deleting the added column makes the original schema current again, while the added one stays last
+    with table.update_schema() as schema_update:
+        schema_update.delete_column("qux")
+    assert table.metadata.current_schema_id != table.metadata.schemas[-1].schema_id
+    assert_legacy_fields(["foo", "bar", "baz"], ["foo"])
+    with table.update_spec() as spec_update:
+        spec_update.add_field("bar", BucketTransform(4), "bar_bucket")
+    assert_legacy_fields(["foo", "bar", "baz"], ["foo", "bar_bucket"])
+
+    # A commit without changes keeps a file whose legacy fields another writer left stale
+    with table.io.new_input(table.metadata_location).open() as stream:
+        metadata = json.loads(stream.read())
+    metadata["schema"] = metadata["schemas"][-1]
+    metadata["partition-spec"] = metadata["partition-specs"][0]["fields"]
+    with table.io.new_output(table.metadata_location).create(overwrite=True) as output:
+        output.write(json.dumps(metadata).encode())
+    table = catalog.load_table(identifier)
+    assert table.metadata.schema_ != table.schema()
+    metadata_location = table.metadata_location
+    metadata_files = set(Path(metadata_location.removeprefix("file://")).parent.iterdir())
+    table.transaction().set_properties({}).commit_transaction()
+    assert table.metadata_location == metadata_location
+    assert set(Path(metadata_location.removeprefix("file://")).parent.iterdir()) == metadata_files
+    # A commit with changes corrects them
+    table.transaction().set_properties({"owner": "test"}).commit_transaction()
+    assert_legacy_fields(["foo", "bar", "baz"], ["foo", "bar_bucket"])
+
+
 @pytest.mark.parametrize("format_version", [1, 2])
 def test_create_table_rejects_encryption_properties_before_v3(
     catalog: Catalog, table_schema_nested: Schema, test_table_identifier: Identifier, format_version: int
